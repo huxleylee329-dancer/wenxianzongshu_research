@@ -21,6 +21,20 @@ class SemanticScholarSearch:
     BULK_URL = f"{BASE_URL}/bulk"
     VALID_SORT_CRITERIA = ["relevance", "citationCount", "publicationDate"]
     REQUEST_TIMEOUT_SECONDS = 10
+    JOURNAL_TOKEN_TO_VENUES = {
+        "tgars": ("IEEE Transactions on Geoscience and Remote Sensing",),
+        "jstars": (
+            "IEEE Journal of Selected Topics in Applied Earth Observations and "
+            "Remote Sensing",
+        ),
+        "taes": ("IEEE Transactions on Aerospace and Electronic Systems",),
+        "remote_sensing": ("Remote Sensing",),
+        "journal_of_radars": (
+            "Journal of Radars",
+            "雷达学报",
+            "雷达学报(中英文)",
+        ),
+    }
 
     def __init__(self, query: str, sort: str = "relevance", query_domains=None):
         """
@@ -44,11 +58,25 @@ class SemanticScholarSearch:
         :param max_results: Maximum number of results to retrieve
         :return: List of dictionaries containing title, href, and body of each paper
         """
+        try:
+            venue_filter = self._configured_venue_filter()
+        except Exception as exc:
+            logger.error(
+                "Semantic Scholar journal configuration failure (%s)",
+                type(exc).__name__,
+            )
+            return []
+
+        if venue_filter == "":
+            return []
+
         params = {
             "query": self.query,
             "limit": max_results,
             "fields": "title,abstract,url,authors,year,venue,externalIds",
         }
+        if venue_filter is not None:
+            params["venue"] = venue_filter
         request_url = self.BASE_URL
         if self.sort != "relevance":
             request_url = self.BULK_URL
@@ -134,6 +162,46 @@ class SemanticScholarSearch:
                     break
 
         return search_result
+
+    @classmethod
+    def _configured_venue_filter(cls):
+        raw_journals = os.getenv("SEMANTIC_SCHOLAR_JOURNALS", "")
+        if not raw_journals.strip():
+            return None
+
+        tokens = []
+        seen_tokens = set()
+        for item in raw_journals.split(","):
+            token = item.strip().lower()
+            if not token or token in seen_tokens:
+                continue
+            seen_tokens.add(token)
+            tokens.append(token)
+
+        venues = []
+        seen_venues = set()
+        invalid_count = 0
+        for token in tokens:
+            token_venues = cls.JOURNAL_TOKEN_TO_VENUES.get(token)
+            if token_venues is None:
+                invalid_count += 1
+                continue
+            for venue in token_venues:
+                if venue in seen_venues:
+                    continue
+                seen_venues.add(venue)
+                venues.append(venue)
+
+        if invalid_count or not venues:
+            logger.warning(
+                "Semantic Scholar journal configuration rejected entries "
+                "(count=%d)",
+                invalid_count,
+            )
+
+        if not venues:
+            return ""
+        return ",".join(venues)
 
     @staticmethod
     def _normalize_result(result):
