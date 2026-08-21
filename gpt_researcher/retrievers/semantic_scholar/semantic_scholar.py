@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Dict, List
 
 import requests
@@ -17,6 +18,7 @@ class SemanticScholarSearch:
     BODY_IS_PREFETCHED_CONTENT = True
 
     BASE_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
+    BULK_URL = f"{BASE_URL}/bulk"
     VALID_SORT_CRITERIA = ["relevance", "citationCount", "publicationDate"]
     REQUEST_TIMEOUT_SECONDS = 10
 
@@ -46,15 +48,23 @@ class SemanticScholarSearch:
             "query": self.query,
             "limit": max_results,
             "fields": "title,abstract,url,authors,year,venue,externalIds",
-            "sort": self.sort,
         }
+        request_url = self.BASE_URL
+        if self.sort != "relevance":
+            request_url = self.BULK_URL
+            params["sort"] = f"{self.sort}:desc"
+
+        raw_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
+        normalized_key = raw_key.strip()
+        request_kwargs = {
+            "params": params,
+            "timeout": self.REQUEST_TIMEOUT_SECONDS,
+        }
+        if normalized_key:
+            request_kwargs["headers"] = {"x-api-key": normalized_key}
 
         try:
-            response = requests.get(
-                self.BASE_URL,
-                params=params,
-                timeout=self.REQUEST_TIMEOUT_SECONDS,
-            )
+            response = requests.get(request_url, **request_kwargs)
             response.raise_for_status()
         except requests.Timeout as exc:
             logger.error(
@@ -67,7 +77,20 @@ class SemanticScholarSearch:
             )
             return []
         except requests.HTTPError as exc:
-            logger.error("Semantic Scholar HTTP failure (%s)", type(exc).__name__)
+            try:
+                candidate_status = (
+                    exc.response.status_code
+                    if exc.response is not None
+                    else "unknown"
+                )
+                status_code = (
+                    candidate_status
+                    if isinstance(candidate_status, int)
+                    else "unknown"
+                )
+            except Exception:
+                status_code = "unknown"
+            logger.error("Semantic Scholar HTTP failure (status=%s)", status_code)
             return []
         except requests.RequestException as exc:
             logger.error(
