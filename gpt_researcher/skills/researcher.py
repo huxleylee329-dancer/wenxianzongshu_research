@@ -858,6 +858,23 @@ class ResearchConductor:
                             "raw_content": raw_content,
                         })
                         self.researcher.add_research_sources([{"url": url}])
+                    elif (
+                        url
+                        and getattr(
+                            retriever_class,
+                            "BODY_IS_PREFETCHED_CONTENT",
+                            False,
+                        )
+                    ):
+                        body = result.get("body")
+                        if isinstance(body, str) and body.strip():
+                            prefetched_content.append({
+                                "url": url,
+                                "raw_content": body,
+                            })
+                            self.researcher.add_research_sources([{"url": url}])
+                        else:
+                            new_search_urls.append(url)
                     elif url:
                         new_search_urls.append(url)
             except Exception as e:
