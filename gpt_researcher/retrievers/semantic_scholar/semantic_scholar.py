@@ -1,10 +1,12 @@
 import logging
 import os
+import re
 from typing import Dict, List
 
 import requests
 
-from ..academic_utils import format_academic_body
+from ...screening.models import ExternalIdentifier, PaperCandidate, build_candidate_id
+from ..academic_utils import format_academic_body, normalize_doi
 
 
 logger = logging.getLogger(__name__)
@@ -58,6 +60,13 @@ class SemanticScholarSearch:
         :param max_results: Maximum number of results to retrieve
         :return: List of dictionaries containing title, href, and body of each paper
         """
+        return [
+            candidate.to_retriever_result()
+            for candidate in self.search_candidates(max_results=max_results)
+        ]
+
+    def search_candidates(self, max_results: int = 20) -> List[PaperCandidate]:
+        """Perform one provider request and return structured paper candidates."""
         try:
             venue_filter = self._configured_venue_filter()
         except Exception as exc:
@@ -73,7 +82,10 @@ class SemanticScholarSearch:
         params = {
             "query": self.query,
             "limit": max_results,
-            "fields": "title,abstract,url,authors,year,venue,externalIds",
+            "fields": (
+                "paperId,title,abstract,url,authors,year,venue,publicationVenue,"
+                "citationCount,publicationTypes,externalIds"
+            ),
         }
         if venue_filter is not None:
             params["venue"] = venue_filter
@@ -145,10 +157,10 @@ class SemanticScholarSearch:
             return []
         results = payload["data"]
 
-        search_result = []
-        for result in results:
+        candidates = []
+        for source_rank, result in enumerate(results, start=1):
             try:
-                normalized = self._normalize_result(result)
+                candidate = self._normalize_candidate(result, source_rank)
             except Exception as exc:
                 logger.warning(
                     "Semantic Scholar result processing failure (%s)",
@@ -156,12 +168,12 @@ class SemanticScholarSearch:
                 )
                 continue
 
-            if normalized is not None:
-                search_result.append(normalized)
-                if len(search_result) >= max_results:
+            if candidate is not None:
+                candidates.append(candidate)
+                if len(candidates) >= max_results:
                     break
 
-        return search_result
+        return candidates
 
     @classmethod
     def _configured_venue_filter(cls):
@@ -203,8 +215,7 @@ class SemanticScholarSearch:
             return ""
         return ",".join(venues)
 
-    @staticmethod
-    def _normalize_result(result):
+    def _normalize_candidate(self, result, source_rank):
         if not isinstance(result, dict):
             return None
 
@@ -226,22 +237,137 @@ class SemanticScholarSearch:
                 if not isinstance(author, dict):
                     continue
                 name = author.get("name")
-                if isinstance(name, str) and name.strip():
-                    authors.append(name.strip())
+                self._append_unique_text(authors, name)
 
-        external_ids = result.get("externalIds")
-        doi = external_ids.get("DOI") if isinstance(external_ids, dict) else None
+        raw_external_ids = result.get("externalIds")
+        raw_doi = (
+            raw_external_ids.get("DOI")
+            if isinstance(raw_external_ids, dict)
+            else None
+        )
+        doi = normalize_doi(raw_doi)
+        external_ids = self._normalize_external_ids(raw_external_ids, doi)
+        published_year = self._normalize_year(result.get("year"))
+        venue = self._optional_text(result.get("venue"))
 
-        return {
-            "title": title,
-            "href": href,
-            "body": format_academic_body(
-                title=title,
-                authors=authors,
-                year=result.get("year"),
-                venue=result.get("venue"),
+        publication_venue = result.get("publicationVenue")
+        if not isinstance(publication_venue, dict):
+            publication_venue = {}
+
+        source_record_id = self._optional_text(result.get("paperId"))
+        citation_count = self._normalize_citation_count(
+            result.get("citationCount")
+        )
+        publication_types = self._normalize_string_sequence(
+            result.get("publicationTypes")
+        )
+        alternate_names = self._normalize_string_sequence(
+            publication_venue.get("alternate_names")
+        )
+
+        body = format_academic_body(
+            title=title,
+            authors=tuple(authors),
+            year=published_year,
+            venue=venue,
+            doi=doi,
+            source="Semantic Scholar",
+            abstract=abstract,
+        )
+
+        return PaperCandidate(
+            candidate_id=build_candidate_id(
+                source="semantic_scholar",
+                source_record_id=source_record_id,
                 doi=doi,
-                source="Semantic Scholar",
-                abstract=abstract,
+                href=href,
             ),
-        }
+            source="semantic_scholar",
+            source_record_id=source_record_id,
+            retrieval_query=self.query,
+            source_rank=source_rank,
+            title=title,
+            href=href,
+            body=body,
+            abstract=abstract,
+            authors=tuple(authors),
+            published_year=published_year,
+            published_at=None,
+            updated_at=None,
+            venue=venue,
+            publication_venue_id=self._optional_text(
+                publication_venue.get("id")
+            ),
+            publication_venue_name=self._optional_text(
+                publication_venue.get("name")
+            ),
+            publication_venue_type=self._optional_text(
+                publication_venue.get("type")
+            ),
+            publication_venue_alternate_names=alternate_names,
+            doi=doi,
+            external_ids=external_ids,
+            citation_count=citation_count,
+            publication_types=publication_types,
+            categories=(),
+            journal_reference=None,
+        )
+
+    @staticmethod
+    def _optional_text(value):
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @classmethod
+    def _append_unique_text(cls, values, value):
+        normalized = cls._optional_text(value)
+        if normalized and normalized not in values:
+            values.append(normalized)
+
+    @classmethod
+    def _normalize_string_sequence(cls, values):
+        if not isinstance(values, (list, tuple)):
+            return ()
+        normalized = []
+        for value in values:
+            cls._append_unique_text(normalized, value)
+        return tuple(normalized)
+
+    @classmethod
+    def _normalize_external_ids(cls, values, doi):
+        if not isinstance(values, dict):
+            return ()
+
+        identifiers = []
+        seen_names = set()
+        for raw_name, raw_value in values.items():
+            name = cls._optional_text(raw_name)
+            if not name or name in seen_names:
+                continue
+            value = doi if name == "DOI" else cls._optional_text(raw_value)
+            if not value:
+                continue
+            seen_names.add(name)
+            identifiers.append(ExternalIdentifier(name=name, value=value))
+        return tuple(identifiers)
+
+    @staticmethod
+    def _normalize_year(value):
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if 1000 <= value <= 9999 else None
+        if isinstance(value, str):
+            normalized = value.strip()
+            if re.fullmatch(r"\d{4}", normalized):
+                year = int(normalized)
+                return year if 1000 <= year <= 9999 else None
+        return None
+
+    @staticmethod
+    def _normalize_citation_count(value):
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value if value >= 0 else None
