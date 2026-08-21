@@ -1,5 +1,12 @@
-"""Internal paper-screening data models."""
+"""Internal paper-screening models and run-scoped collection."""
 
+from .collection import CollectorState, PaperCandidateCollector
 from .models import ExternalIdentifier, PaperCandidate, build_candidate_id
 
-__all__ = ["ExternalIdentifier", "PaperCandidate", "build_candidate_id"]
+__all__ = [
+    "CollectorState",
+    "ExternalIdentifier",
+    "PaperCandidate",
+    "PaperCandidateCollector",
+    "build_candidate_id",
+]

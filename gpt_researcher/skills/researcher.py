@@ -11,7 +11,11 @@ import os
 import random
 
 from ..actions.agent_creator import choose_agent
-from ..actions.query_processing import get_search_results, plan_research_outline
+from ..actions.query_processing import (
+    execute_retriever_search,
+    get_search_results,
+    plan_research_outline,
+)
 from ..actions.utils import stream_output
 from ..document import DocumentLoader, LangChainDocumentLoader, OnlineDocumentLoader
 from ..utils.enum import ReportSource, ReportType
@@ -838,9 +842,16 @@ class ResearchConductor:
                 # Instantiate the retriever with the sub-query
                 retriever = retriever_class(query, query_domains=query_domains)
 
-                # Perform the search using the current retriever
-                search_results = await asyncio.to_thread(
-                    retriever.search, max_results=self.researcher.cfg.max_search_results_per_query
+                # Perform one request and collect academic candidates only after
+                # the worker thread returns to the event loop.
+                search_results = await execute_retriever_search(
+                    retriever,
+                    max_results=self.researcher.cfg.max_search_results_per_query,
+                    collector=getattr(
+                        self.researcher,
+                        "_paper_candidate_collector",
+                        None,
+                    ),
                 )
 
                 if not search_results:

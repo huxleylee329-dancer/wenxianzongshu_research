@@ -5,6 +5,11 @@ from typing import List, Dict, Set, Optional, Any
 from fastapi import WebSocket
 
 from gpt_researcher import GPTResearcher
+from gpt_researcher.screening.collection import (
+    CollectorState,
+    PaperCandidateCollector,
+)
+from gpt_researcher.screening.models import PaperCandidate
 
 
 class DetailedReport:
@@ -65,6 +70,8 @@ class DetailedReport:
             gpt_researcher_params["mcp_strategy"] = mcp_strategy
 
         self.gpt_researcher = GPTResearcher(**gpt_researcher_params)
+        self._paper_candidate_collector: PaperCandidateCollector | None = None
+        self._paper_candidate_run_active = False
 
         # Override max_search_results_per_query if provided by user
         if max_search_results is not None:
@@ -82,13 +89,52 @@ class DetailedReport:
         return f"detailed_{timestamp}_{query_hash}"
 
     async def run(self) -> str:
-        await self._initial_research()
-        subtopics = await self._get_all_subtopics()
-        report_introduction = await self.gpt_researcher.write_introduction()
-        _, report_body = await self._generate_subtopic_reports(subtopics)
-        self.gpt_researcher.visited_urls.update(self.global_urls)
-        report = await self._construct_detailed_report(report_introduction, report_body)
-        return report
+        if self._paper_candidate_run_active:
+            raise RuntimeError("a DetailedReport candidate run is already active")
+
+        self._paper_candidate_run_active = True
+        new_collector = None
+        try:
+            # Invalidate the previous run before creating and binding the new one.
+            self.gpt_researcher._bind_paper_candidate_collector(
+                None,
+                owner=False,
+            )
+            self._paper_candidate_collector = None
+            new_collector = PaperCandidateCollector()
+            self._paper_candidate_collector = new_collector
+            self.gpt_researcher._bind_paper_candidate_collector(
+                new_collector,
+                owner=False,
+            )
+
+            await self._initial_research()
+            subtopics = await self._get_all_subtopics()
+            report_introduction = await self.gpt_researcher.write_introduction()
+            _, report_body = await self._generate_subtopic_reports(subtopics)
+            self.gpt_researcher.visited_urls.update(self.global_urls)
+            report = await self._construct_detailed_report(
+                report_introduction,
+                report_body,
+            )
+            new_collector.finalize()
+            return report
+        except asyncio.CancelledError:
+            if new_collector is not None and new_collector.state is CollectorState.OPEN:
+                new_collector.abort()
+            raise
+        except Exception:
+            if new_collector is not None and new_collector.state is CollectorState.OPEN:
+                new_collector.abort()
+            raise
+        finally:
+            self._paper_candidate_run_active = False
+
+    def get_paper_candidates(self) -> tuple[PaperCandidate, ...]:
+        """Return this Detailed Report run's finalized candidate snapshot."""
+        if self._paper_candidate_collector is None:
+            raise RuntimeError("no DetailedReport candidate run is available")
+        return self._paper_candidate_collector.snapshot()
 
     async def _initial_research(self) -> None:
         await self.gpt_researcher.conduct_research()
@@ -154,7 +200,9 @@ class DetailedReport:
             source_urls=self.source_urls,
             # Propagate MCP configuration so follow-up researchers can use MCP
             mcp_configs=self.gpt_researcher.mcp_configs,
-            mcp_strategy=self.gpt_researcher.mcp_strategy
+            mcp_strategy=self.gpt_researcher.mcp_strategy,
+            _paper_candidate_collector=self._paper_candidate_collector,
+            _paper_candidate_collector_owner=False,
         )
 
         # Propagate max_search_results override to subtopic researcher

@@ -1,8 +1,12 @@
+import asyncio
+import logging
 from typing import Any, Dict, List
 
 import json_repair
 
 from gpt_researcher.llm_provider.generic.base import ReasoningEfforts
+from gpt_researcher.screening.collection import PaperCandidateCollector
+from gpt_researcher.screening.models import PaperCandidate
 
 
 def _normalize_sub_queries(parsed: Any, fallback_query: str) -> List[str]:
@@ -37,9 +41,48 @@ def _normalize_sub_queries(parsed: Any, fallback_query: str) -> List[str]:
 from ..utils.llm import create_chat_completion
 from ..prompts import PromptFamily
 from ..config import Config
-import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _run_retriever_once(search_retriever, max_results: int | None):
+    """Run one blocking Retriever call without capturing collector state."""
+    search_candidates = getattr(search_retriever, "search_candidates", None)
+    search_kwargs = {}
+    if max_results is not None:
+        search_kwargs["max_results"] = max_results
+
+    if callable(search_candidates):
+        candidates = tuple(search_candidates(**search_kwargs))
+        if not all(isinstance(candidate, PaperCandidate) for candidate in candidates):
+            raise TypeError(
+                "search_candidates() must yield only PaperCandidate values"
+            )
+        return True, candidates
+
+    return False, search_retriever.search(**search_kwargs)
+
+
+async def execute_retriever_search(
+    search_retriever,
+    *,
+    max_results: int | None = None,
+    collector: PaperCandidateCollector | None = None,
+) -> List[Dict[str, Any]]:
+    """Execute one Retriever request and collect candidates after thread return."""
+    candidate_capable, payload = await asyncio.to_thread(
+        _run_retriever_once,
+        search_retriever,
+        max_results,
+    )
+
+    if not candidate_capable:
+        return payload
+
+    candidates: tuple[PaperCandidate, ...] = payload
+    if collector is not None:
+        collector.add_batch(candidates)
+    return [candidate.to_retriever_result() for candidate in candidates]
 
 async def get_search_results(
     query: str,
@@ -61,8 +104,6 @@ async def get_search_results(
     Returns:
         A list of search results
     """
-    import asyncio
-
     # Check if this is an MCP retriever and pass the researcher instance
     if "mcpretriever" in retriever.__name__.lower():
         search_retriever = retriever(
@@ -73,12 +114,12 @@ async def get_search_results(
     else:
         search_retriever = retriever(query, query_domains=query_domains)
 
-    search_kwargs = {}
-    if max_results is not None:
-        search_kwargs["max_results"] = max_results
-
-    # Retriever searches are blocking HTTP calls; keep the event loop free
-    return await asyncio.to_thread(search_retriever.search, **search_kwargs)
+    collector = getattr(researcher, "_paper_candidate_collector", None)
+    return await execute_retriever_search(
+        search_retriever,
+        max_results=max_results,
+        collector=collector,
+    )
 
 async def generate_sub_queries(
     query: str,

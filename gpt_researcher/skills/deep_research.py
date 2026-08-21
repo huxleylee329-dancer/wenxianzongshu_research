@@ -430,6 +430,17 @@ Return ONLY a JSON object using this exact schema:
                         on_progress(progress)
 
                     from .. import GPTResearcher
+                    candidate_collector = getattr(
+                        self.researcher,
+                        "_paper_candidate_collector",
+                        None,
+                    )
+                    candidate_kwargs = {}
+                    if candidate_collector is not None:
+                        candidate_kwargs = {
+                            "_paper_candidate_collector": candidate_collector,
+                            "_paper_candidate_collector_owner": False,
+                        }
                     researcher = GPTResearcher(
                         query=serp_query['query'],
                         report_type=ReportType.ResearchReport.value,
@@ -441,7 +452,8 @@ Return ONLY a JSON object using this exact schema:
                         visited_urls=self.visited_urls,
                         # Propagate MCP configuration to nested researchers
                         mcp_configs=self.researcher.mcp_configs,
-                        mcp_strategy=self.researcher.mcp_strategy
+                        mcp_strategy=self.researcher.mcp_strategy,
+                        **candidate_kwargs,
                     )
 
                     # Conduct research

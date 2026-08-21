@@ -22,6 +22,8 @@ from .config import Config
 from .llm_provider import GenericLLMProvider
 from .memory import Memory
 from .prompts import get_prompt_family
+from .screening.collection import CollectorState, PaperCandidateCollector
+from .screening.models import PaperCandidate
 from .skills.browser import BrowserManager
 from .skills.context_manager import ContextManager
 from .skills.curator import SourceCurator
@@ -80,6 +82,8 @@ class GPTResearcher:
         mcp_configs: list[dict] | None = None,
         mcp_max_iterations: int | None = None,
         mcp_strategy: str | None = None,
+        _paper_candidate_collector: PaperCandidateCollector | None = None,
+        _paper_candidate_collector_owner: bool = False,
         **kwargs
     ):
         """
@@ -167,6 +171,20 @@ class GPTResearcher:
         self._current_step: str = "general"
         self.log_handler = log_handler
         self.prompt_family = get_prompt_family(prompt_family or self.cfg.prompt_family, self.cfg)
+
+        self._paper_candidate_collector: PaperCandidateCollector | None = None
+        self._paper_candidate_collector_owner = False
+        self._paper_candidate_collector_borrower = False
+        self._paper_candidate_run_active = False
+        if _paper_candidate_collector is not None:
+            if _paper_candidate_collector_owner:
+                raise ValueError("injected paper candidate collectors must be borrowed")
+            self._bind_paper_candidate_collector(
+                _paper_candidate_collector,
+                owner=False,
+            )
+        elif _paper_candidate_collector_owner:
+            raise ValueError("a collector is required for injected ownership")
         
         # Process MCP configurations if provided
         self.mcp_configs = mcp_configs
@@ -199,6 +217,57 @@ class GPTResearcher:
 
         # Handle MCP strategy configuration with backwards compatibility
         self.mcp_strategy = self._resolve_mcp_strategy(mcp_strategy, mcp_max_iterations)
+
+    def _bind_paper_candidate_collector(
+        self,
+        collector: PaperCandidateCollector | None,
+        *,
+        owner: bool,
+    ) -> None:
+        """Use the single frozen binding path for owned and borrowed collectors."""
+        if owner and collector is None:
+            raise ValueError("an owned paper candidate collector cannot be None")
+        if getattr(self, "_paper_candidate_run_active", False):
+            raise RuntimeError("a paper candidate run is already active")
+
+        self._paper_candidate_collector = collector
+        self._paper_candidate_collector_owner = owner
+        self._paper_candidate_collector_borrower = not owner
+
+    def _begin_paper_candidate_run(self) -> None:
+        """Start a fresh collector for a top-level GPTResearcher run."""
+        if getattr(self, "_paper_candidate_run_active", False):
+            raise RuntimeError("a paper candidate run is already active")
+        if getattr(self, "_paper_candidate_collector_borrower", False):
+            raise RuntimeError("a borrowed paper candidate collector cannot begin a run")
+
+        self._bind_paper_candidate_collector(PaperCandidateCollector(), owner=True)
+        self._paper_candidate_run_active = True
+
+    def _finalize_paper_candidate_run(self) -> None:
+        if not getattr(self, "_paper_candidate_run_active", False):
+            raise RuntimeError("no owned paper candidate run is active")
+        if not self._paper_candidate_collector_owner:
+            raise RuntimeError("a borrower cannot finalize paper candidates")
+        self._paper_candidate_collector.finalize()
+        self._paper_candidate_run_active = False
+
+    def _abort_paper_candidate_run(self) -> None:
+        if not getattr(self, "_paper_candidate_run_active", False):
+            raise RuntimeError("no owned paper candidate run is active")
+        if not self._paper_candidate_collector_owner:
+            raise RuntimeError("a borrower cannot abort paper candidates")
+        try:
+            if self._paper_candidate_collector.state is CollectorState.OPEN:
+                self._paper_candidate_collector.abort()
+        finally:
+            self._paper_candidate_run_active = False
+
+    def get_paper_candidates(self) -> tuple[PaperCandidate, ...]:
+        """Return the immutable finalized candidate snapshot for this run."""
+        if self._paper_candidate_collector is None:
+            raise RuntimeError("no paper candidate run is available")
+        return self._paper_candidate_collector.snapshot()
     
     def _generate_research_id(self) -> str:
         """Generate a unique research ID for this session.
@@ -329,6 +398,30 @@ class GPTResearcher:
                 logging.getLogger('research').error(f"Error in _log_event: {e}", exc_info=True)
 
     async def conduct_research(self, on_progress=None):
+        """Conduct one owned or borrowed research run."""
+        owns_run = not getattr(
+            self,
+            "_paper_candidate_collector_borrower",
+            False,
+        )
+        if owns_run:
+            self._begin_paper_candidate_run()
+
+        try:
+            result = await self._conduct_research_impl(on_progress)
+            if owns_run:
+                self._finalize_paper_candidate_run()
+            return result
+        except asyncio.CancelledError:
+            if owns_run:
+                self._abort_paper_candidate_run()
+            raise
+        except Exception:
+            if owns_run:
+                self._abort_paper_candidate_run()
+            raise
+
+    async def _conduct_research_impl(self, on_progress=None):
         """Conduct the research process.
 
         This method orchestrates the main research workflow including
@@ -517,6 +610,41 @@ class GPTResearcher:
         return intro
 
     async def quick_search(
+        self,
+        query: str,
+        query_domains: list[str] = None,
+        aggregated_summary: bool = False,
+        all_retrievers: bool = False,
+    ) -> list[Any] | str:
+        """Perform one owned or borrowed Quick Search run."""
+        owns_run = not getattr(
+            self,
+            "_paper_candidate_collector_borrower",
+            False,
+        )
+        if owns_run:
+            self._begin_paper_candidate_run()
+
+        try:
+            result = await self._quick_search_impl(
+                query,
+                query_domains=query_domains,
+                aggregated_summary=aggregated_summary,
+                all_retrievers=all_retrievers,
+            )
+            if owns_run:
+                self._finalize_paper_candidate_run()
+            return result
+        except asyncio.CancelledError:
+            if owns_run:
+                self._abort_paper_candidate_run()
+            raise
+        except Exception:
+            if owns_run:
+                self._abort_paper_candidate_run()
+            raise
+
+    async def _quick_search_impl(
         self,
         query: str,
         query_domains: list[str] = None,
