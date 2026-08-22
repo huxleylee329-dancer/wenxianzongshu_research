@@ -385,3 +385,94 @@ def test_topic_decisions_drive_routes_and_preserve_validated_rationale(
     payload = audit_pass.model_dump_json()
     assert "RAW_ABSTRACT_SENTINEL" not in payload
     assert "RAW_BODY_SENTINEL" not in payload
+
+
+def _build_topic_audit_with_group_canonical_pattern(pattern):
+    policy = ScreeningPolicy(min_year=2020)
+    occurrences = tuple(
+        CandidateOccurrence(
+            occurrence_id=f"occ:{index}",
+            retrieval_request_id="evidence:000001",
+            planning_only=False,
+            candidate=_candidate(
+                f"candidate-{index}",
+                doi=f"10.1/{chr(96 + index)}",
+                year=2024 if has_canonical else 2010,
+                rank=index,
+            ),
+        )
+        for index, has_canonical in enumerate(pattern, start=1)
+    )
+    deterministic = screen_paper_occurrences(occurrences, policy)
+    canonical_groups = tuple(
+        group
+        for group in deterministic.duplicate_groups
+        if group.canonical_occurrence_id is not None
+    )
+    occurrence_by_id = {
+        occurrence.occurrence_id: occurrence
+        for occurrence in deterministic.occurrences
+    }
+    decisions = tuple(
+        TopicRelevanceDecision(
+            decision_order=decision_order,
+            duplicate_group_id=group.group_id,
+            canonical_occurrence_id=group.canonical_occurrence_id,
+            canonical_candidate_id=occurrence_by_id[
+                group.canonical_occurrence_id
+            ].candidate.candidate_id,
+            verdict=TopicRelevanceVerdict.RELEVANT,
+            reason_code=TopicRelevanceReasonCode.DIRECT_TOPIC_MATCH,
+            rationale="Relevant.",
+            confidence=100,
+        )
+        for decision_order, group in enumerate(canonical_groups, start=1)
+    )
+    topic = TopicScreeningResult(
+        deterministic_result=deterministic,
+        relevance_decisions=decisions,
+        effective_routes=deterministic.routes,
+    )
+    return build_paper_screening_web_pass_audit(
+        web_pass_order=1,
+        web_pass_id="web-pass:000001",
+        policy=policy,
+        topic_relevance_enabled=True,
+        deterministic_result=deterministic,
+        topic_result=topic,
+        request_metadata=(
+            PaperScreeningRequestMetadata(
+                retrieval_request_id="evidence:000001",
+                planning_only=False,
+                retrieval_query="query",
+                provider_warnings=(),
+            ),
+        ),
+    )
+
+
+def test_topic_decision_order_ignores_leading_group_without_canonical():
+    audit_pass = _build_topic_audit_with_group_canonical_pattern((False, True))
+
+    assert tuple(group.pass_group_order for group in audit_pass.group_audits) == (
+        1,
+        2,
+    )
+    assert tuple(
+        None if group.topic_decision is None else group.topic_decision.decision_order
+        for group in audit_pass.group_audits
+    ) == (None, 1)
+
+
+def test_topic_decision_order_remains_contiguous_across_group_gap():
+    audit_pass = _build_topic_audit_with_group_canonical_pattern((True, False, True))
+
+    assert tuple(group.pass_group_order for group in audit_pass.group_audits) == (
+        1,
+        2,
+        3,
+    )
+    assert tuple(
+        None if group.topic_decision is None else group.topic_decision.decision_order
+        for group in audit_pass.group_audits
+    ) == (1, None, 2)

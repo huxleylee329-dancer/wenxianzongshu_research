@@ -594,12 +594,15 @@ class PaperScreeningWebPassAudit(_StrictAuditModel):
             raise ValueError("pass included references must follow group order")
         if self.routed_canonical_occurrence_refs != expected_routed_refs:
             raise ValueError("pass routed references must follow group order")
-        for group in self.group_audits:
-            if (
-                group.topic_decision is not None
-                and group.topic_decision.decision_order != group.pass_group_order
-            ):
-                raise ValueError("pass topic decision order must mirror group order")
+        topic_decision_orders = tuple(
+            group.topic_decision.decision_order
+            for group in self.group_audits
+            if group.topic_decision is not None
+        )
+        if topic_decision_orders != tuple(
+            range(1, len(topic_decision_orders) + 1)
+        ):
+            raise ValueError("pass topic decision order must be contiguous")
         return self
 
 
