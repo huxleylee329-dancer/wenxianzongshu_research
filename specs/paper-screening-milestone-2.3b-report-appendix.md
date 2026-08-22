@@ -2,12 +2,12 @@
 
 Status: **Approved and frozen**
 
-This standalone specification has completed human review and received explicit
-implementation approval. Implementation must remain strictly inside the frozen
-seven-file boundary in Section 14. If implementation requires an eighth file,
-it must stop immediately, this specification must be revised, and the revision
-must receive a new explicit approval. The frozen specification must not be
-modified during implementation.
+The IDNA hostname safety revision has completed read-only review and received
+renewed explicit approval. Implementation may continue under this revised frozen
+specification and remains strictly limited to the original seven-file boundary
+in Section 14. If an eighth file is required, implementation must stop again and
+receive a new explicit approval. This specification must not be modified during
+subsequent implementation.
 
 Milestone 2.3B adds presentation only. It does not change which papers are
 screened, included, excluded, routed, compressed, or cited.
@@ -951,9 +951,21 @@ codec and performing no I/O:
     - reject every empty label, including a leading dot, trailing dot, or
       consecutive dots;
     - encode every label with Python's built-in IDNA codec;
-    - any encoding failure is fatal and cannot fall back to the Unicode host;
+    - decode the encoded bytes with strict ASCII decoding;
+    - any encoding or strict ASCII decoding failure is fatal and cannot fall
+      back to the Unicode host;
     - lowercase every encoded ASCII label;
-    - require every encoded label length to be from 1 through 63 bytes; and
+    - require every encoded label byte length to be from 1 through 63;
+    - after lowercasing and length validation, require the complete encoded label
+      to match this exact ASCII regular expression:
+
+      ```python
+      r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+      ```
+
+    - a label that does not match is fatal and cannot be percent-encoded,
+      sanitized, emitted as a link target, or fall back to the original Unicode
+      label; and
     - require the complete dot-joined ASCII host to be at most 253 bytes.
 12. Independently scan path, query, and fragment. Every `%` must be followed by
     exactly two hexadecimal characters or the URL is fatal. Normalize the two
@@ -1338,8 +1350,17 @@ The approved implementation suite must cover at least the following.
 - exact path/query/fragment safe constants and UTF-8 percent encoding;
 - valid existing percent escapes are preserved with uppercase hex while a
   malformed percent escape is fatal;
-- whitespace, backslash, parentheses, brackets, angle brackets, quotes,
-  backtick, and pipe are percent-encoded and never appear raw in the target;
+- only path, query, and fragment component characters are percent-encoded under
+  their respective frozen safe sets; this percent-encoding rule never applies
+  to the scheme, authority, hostname, or port;
+- an HTTP/HTTPS hostname must first and exclusively satisfy its IPv4, IPv6, or
+  IDNA hostname branch. In an IDNA hostname, whitespace, parentheses, square
+  brackets, percent signs, underscores, plus signs, backticks, and every other
+  character that fails the frozen LDH regular expression are fatal;
+- a failing hostname must not be repaired through `quote()`, percent-encoding,
+  sanitization, character deletion, Unicode fallback, or plain-text downgrade;
+  the same character classes in path, query, or fragment remain subject to the
+  exact percent-encoding rules of their respective frozen safe sets;
 - `javascript:`, `file:`, `data:`, missing-scheme, and other unsupported URLs
   are non-clickable escaped text;
 - malformed supported URLs, invalid hosts, userinfo, control characters, and
@@ -1373,6 +1394,44 @@ link bytes, exact one-time occurrence of `normalized_url`, no title attribute,
 no angle brackets, no bare/reference-style/HTML/backtick link, no second text-
 sanitizer pass over `normalized_url`, and exact plain-text output for a missing
 or non-HTTP/HTTPS scheme.
+
+The following HTTP/HTTPS hostname cases each require a direct
+`pytest.raises(...)` assertion or a semantically equivalent strict fatal
+assertion around the formatter call:
+
+- `https://foo)bar/path`;
+- `https://foo(bar/path`;
+- `https://foo bar/path`;
+- `https://foo%20bar/path`;
+- `https://foo_bar/path`;
+- `https://foo+bar/path`;
+- a non-IPv6 hostname containing `[`;
+- a non-IPv6 hostname containing `]`;
+- a hostname containing a backtick;
+- a label with a leading hyphen;
+- a label with a trailing hyphen;
+- an empty label;
+- a 64-byte encoded label; and
+- a 254-byte complete encoded hostname.
+
+Every fatal-hostname test must prove that the formatter raises, returns no
+Markdown value, and generates neither `[Open paper](...)` nor
+`[打开论文](...)`. A `contains` assertion, code inspection, or an indirect failure
+in another URL component cannot substitute for the strict fatal assertion.
+
+Separate success tests must use complete, exact Markdown-link byte equality for:
+
+- a label with a legal internal hyphen;
+- a single-letter label;
+- a single-digit label;
+- a legal Unicode IDNA hostname normalized to the fixed ASCII hostname
+  `xn--fsqu00a.xn--0zwm56d`;
+- a legal `xn--...` punycode label;
+- a 63-byte encoded label; and
+- a 253-byte complete encoded hostname.
+
+Hostname fail-closed tests and path/query/fragment percent-encoding tests are
+two independent test categories. Neither category may stand in for the other.
 
 ### 15.5 Report, WebSocket, history, and export integration
 
@@ -1496,7 +1555,11 @@ structured audit snapshot as a new data product.
 - [ ] Unsupported URL schemes are non-clickable and malformed supported URLs fail closed.
 - [ ] URL userinfo, controls, malformed ports, malformed percent escapes, and Markdown target injection are rejected or encoded as frozen.
 - [ ] DNS/IDNA, IPv4, IPv6, explicit-port grammar and decimal reconstruction, percent-escape, UTF-8, and component-safe normalization follows the sole frozen algorithm.
-- [ ] URL golden tests cover valid/invalid IPv4; bracketed/unbracketed IPv6; zone identifiers; IPvFuture; Unicode, empty-label, overlong-label, and overlong IDNA hosts; authority backslash; userinfo; ports 0/1/65535/65536, leading-zero normalization, explicit default-port preservation, absent ports, empty ports, and nonnumeric ports; every frozen malformed/control percent escape; uppercase percent normalization; all three exact safe sets; exact inline-link bytes; and plain-text javascript/data/file rendering.
+- [ ] URL golden tests cover valid/invalid IPv4; bracketed/unbracketed IPv6; zone identifiers; IPvFuture; authority backslash; userinfo; ports 0/1/65535/65536, leading-zero normalization, explicit default-port preservation, absent ports, empty ports, and nonnumeric ports; every frozen malformed/control percent escape; uppercase percent normalization; all three exact safe sets; exact inline-link bytes; and plain-text javascript/data/file rendering.
+- [ ] Every frozen dangerous hostname, including punctuation, whitespace, percent, underscore, plus, brackets, backtick, leading/trailing hyphen, empty label, 64-byte label, and 254-byte host cases, has a direct strict fatal automated test.
+- [ ] Legal internal-hyphen, single-letter, single-digit, Unicode IDNA, punycode, 63-byte-label, and 253-byte-host cases have direct complete exact-link success tests.
+- [ ] Hostname fail-closed tests are independent from and cannot be replaced by path/query/fragment percent-encoding tests.
+- [ ] No hostname safety acceptance may be claimed only through code review, `contains` assertions, or indirect tests.
 - [ ] Abstract, body, retrieval query, raw response, prompt, header, exception, traceback, and secret data are absent.
 - [ ] The formatter logs neither input nor output and does not modify the snapshot.
 - [ ] Identical inputs produce byte-for-byte identical output.
