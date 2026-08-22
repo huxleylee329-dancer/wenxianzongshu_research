@@ -49,6 +49,8 @@ async def create_chat_completion(
         llm_kwargs: dict[str, Any] | None = None,
         cost_callback: callable = None,
         reasoning_effort: str | None = ReasoningEfforts.Medium.value,
+        *,
+        safe_mode: bool = False,
         **kwargs
 ) -> str:
     """Create a chat completion using the OpenAI API
@@ -79,6 +81,55 @@ async def create_chat_completion(
             "Check your FAST_TOKEN_LIMIT / SMART_TOKEN_LIMIT / "
             "STRATEGIC_TOKEN_LIMIT env vars for typos."
         )
+
+    if safe_mode:
+        safe_llm_kwargs = dict(llm_kwargs or {})
+        safe_llm_kwargs.pop("chat_log", None)
+        safe_provider_kwargs = {'model': model}
+        safe_provider_kwargs.update(safe_llm_kwargs)
+
+        if model in SUPPORT_REASONING_EFFORT_MODELS:
+            safe_provider_kwargs['reasoning_effort'] = reasoning_effort
+        if model not in NO_SUPPORT_TEMPERATURE_MODELS:
+            safe_provider_kwargs['temperature'] = temperature
+        else:
+            safe_provider_kwargs['temperature'] = None
+        safe_provider_kwargs['max_tokens'] = max_tokens
+
+        if llm_provider == "openai":
+            safe_base_url = os.environ.get("OPENAI_BASE_URL", None)
+            if safe_base_url:
+                safe_provider_kwargs['openai_api_base'] = safe_base_url
+
+        provider_failed = False
+        safe_response = None
+        safe_provider = None
+        try:
+            safe_provider = get_llm(llm_provider, **safe_provider_kwargs)
+            safe_response = await safe_provider.get_chat_response(
+                messages, stream, websocket, **kwargs
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            provider_failed = True
+
+        if provider_failed or safe_response is None or safe_response == "":
+            raise RuntimeError("Safe LLM request failed") from None
+
+        if cost_callback:
+            llm_costs = calculate_llm_cost(
+                llm_provider=llm_provider,
+                model=model,
+                input_content=str(messages),
+                output_content=safe_response,
+                response_metadata=safe_provider.last_response_metadata,
+                usage_metadata=safe_provider.last_usage_metadata,
+                request_options=safe_provider_kwargs,
+            )
+            cost_callback(llm_costs)
+
+        return safe_response
 
     # Get the provider from supported providers
     provider_kwargs = {'model': model}

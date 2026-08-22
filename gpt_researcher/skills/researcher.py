@@ -59,6 +59,21 @@ def _strict_screening_enabled(value: Any) -> bool:
     raise ValueError("PAPER_SCREENING_ENABLED must be true or false")
 
 
+def _strict_topic_relevance_enabled(value: Any) -> bool:
+    if not isinstance(value, str):
+        raise ValueError(
+            "PAPER_SCREENING_TOPIC_RELEVANCE_ENABLED must be true or false"
+        )
+    normalized = value.strip().casefold()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ValueError(
+        "PAPER_SCREENING_TOPIC_RELEVANCE_ENABLED must be true or false"
+    )
+
+
 def _strict_screening_year(value: Any, name: str) -> int | None:
     if not isinstance(value, str):
         raise ValueError(f"{name} must be empty or a four-digit year")
@@ -145,6 +160,7 @@ class ResearchConductor:
         self._paper_screening_enabled = False
         self._paper_screening_policy: ScreeningPolicy | None = None
         self._paper_screening_candidate_capable = False
+        self._paper_topic_relevance_enabled = False
 
     def _bind_paper_screening_for_run(self) -> None:
         """Bind one full-research run after its candidate run guard opens."""
@@ -189,6 +205,22 @@ class ResearchConductor:
         self._paper_screening_candidate_capable = any(
             callable(getattr(retriever, "search_candidates", None))
             for retriever in self.researcher.retrievers
+        )
+        if not self._paper_screening_candidate_capable:
+            return
+        if (
+            getattr(self.researcher, "report_source", None)
+            != ReportSource.Web.value
+            or getattr(self.researcher, "report_type", None)
+            != ReportType.ResearchReport.value
+        ):
+            return
+        self._paper_topic_relevance_enabled = _strict_topic_relevance_enabled(
+            getattr(
+                self.researcher.cfg,
+                "paper_screening_topic_relevance_enabled",
+                "false",
+            )
         )
 
     def _should_use_paper_screening(self) -> bool:
@@ -758,8 +790,14 @@ class ResearchConductor:
         self,
         prepared: PreparedEvidenceRequest,
         workspace: ScreeningWorkspace,
+        *,
+        canonical_occurrence_ids: tuple[str, ...] | None = None,
     ) -> str:
-        canonical_ids = workspace.route_for(prepared.retrieval_request_id)
+        canonical_ids = (
+            workspace.route_for(prepared.retrieval_request_id)
+            if canonical_occurrence_ids is None
+            else canonical_occurrence_ids
+        )
         routed_academic: list[dict[str, str]] = []
         for occurrence_id in canonical_ids:
             candidate = workspace.canonical_candidate(occurrence_id)
@@ -832,13 +870,41 @@ class ResearchConductor:
                     for request_id, sub_query in request_items
                 ]
             )
-            workspace.screen()
-            contexts = await asyncio.gather(
-                *[
-                    self._consume_prepared_evidence(prepared, workspace)
-                    for prepared in prepared_requests
-                ]
-            )
+            deterministic_result = workspace.screen()
+            if self._paper_topic_relevance_enabled:
+                from ..actions.paper_relevance import assess_topic_relevance
+
+                topic_result = await assess_topic_relevance(
+                    query,
+                    deterministic_result,
+                    self.researcher.cfg,
+                    self.researcher.add_costs,
+                )
+                effective_routes = {
+                    route.retrieval_request_id: route.canonical_occurrence_ids
+                    for route in topic_result.effective_routes
+                }
+                if len(effective_routes) != len(topic_result.effective_routes):
+                    raise ValueError("topic result contains duplicate routes")
+                contexts = await asyncio.gather(
+                    *[
+                        self._consume_prepared_evidence(
+                            prepared,
+                            workspace,
+                            canonical_occurrence_ids=effective_routes.get(
+                                prepared.retrieval_request_id, ()
+                            ),
+                        )
+                        for prepared in prepared_requests
+                    ]
+                )
+            else:
+                contexts = await asyncio.gather(
+                    *[
+                        self._consume_prepared_evidence(prepared, workspace)
+                        for prepared in prepared_requests
+                    ]
+                )
             workspace.finalize()
             contexts = [context for context in contexts if context]
             return " ".join(contexts) if contexts else []

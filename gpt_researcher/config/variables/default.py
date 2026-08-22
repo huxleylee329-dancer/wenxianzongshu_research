@@ -54,6 +54,7 @@ DEFAULT_CONFIG: BaseConfig = {
     "PAPER_SCREENING_UNKNOWN_YEAR": "include",
     "PAPER_SCREENING_ALLOWED_TYPES": "",
     "PAPER_SCREENING_UNKNOWN_TYPE": "include",
+    "PAPER_SCREENING_TOPIC_RELEVANCE_ENABLED": "false",
     
     # Image generation settings (optional - requires GOOGLE_API_KEY)
     # Free tier models: gemini-2.5-flash-image, gemini-2.0-flash-exp-image-generation
