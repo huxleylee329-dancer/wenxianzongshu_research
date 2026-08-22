@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from dataclasses import dataclass
 from typing import Any, Dict, List
 
 import json_repair
@@ -45,7 +46,38 @@ from ..config import Config
 logger = logging.getLogger(__name__)
 
 
-def _run_retriever_once(search_retriever, max_results: int | None):
+class RetrieverBatchError(RuntimeError):
+    """Sanitized failure at the Provider execution boundary."""
+
+    _CATEGORIES = {"call", "materialization", "contract"}
+
+    def __init__(self, category: str):
+        if category not in self._CATEGORIES:
+            raise ValueError("invalid retriever batch error category")
+        self.category = category
+        super().__init__(f"retriever batch {category} failure")
+
+
+@dataclass(frozen=True, slots=True)
+class RetrieverExecutionBatch:
+    """One immutable orchestration result from exactly one Retriever call."""
+
+    projected_results: Any
+    candidates: tuple[PaperCandidate, ...]
+    candidate_capable: bool
+
+
+def _raise_provider_boundary(category: str, original: Exception, classify: bool):
+    if classify:
+        raise RetrieverBatchError(category) from None
+    raise original
+
+
+def _run_retriever_once(
+    search_retriever,
+    max_results: int | None,
+    classify_provider_errors: bool = False,
+):
     """Run one blocking Retriever call without capturing collector state."""
     search_candidates = getattr(search_retriever, "search_candidates", None)
     search_kwargs = {}
@@ -53,14 +85,67 @@ def _run_retriever_once(search_retriever, max_results: int | None):
         search_kwargs["max_results"] = max_results
 
     if callable(search_candidates):
-        candidates = tuple(search_candidates(**search_kwargs))
+        try:
+            candidate_values = search_candidates(**search_kwargs)
+        except Exception as exc:
+            _raise_provider_boundary("call", exc, classify_provider_errors)
+        try:
+            candidates = tuple(candidate_values)
+        except Exception as exc:
+            _raise_provider_boundary("materialization", exc, classify_provider_errors)
         if not all(isinstance(candidate, PaperCandidate) for candidate in candidates):
-            raise TypeError(
+            error = TypeError(
                 "search_candidates() must yield only PaperCandidate values"
             )
+            _raise_provider_boundary("contract", error, classify_provider_errors)
         return True, candidates
 
-    return False, search_retriever.search(**search_kwargs)
+    try:
+        result_values = search_retriever.search(**search_kwargs)
+    except Exception as exc:
+        _raise_provider_boundary("call", exc, classify_provider_errors)
+    try:
+        results = tuple(result_values)
+    except Exception as exc:
+        _raise_provider_boundary("materialization", exc, classify_provider_errors)
+    if not all(isinstance(result, dict) for result in results):
+        error = TypeError("search() must yield only dictionary values")
+        _raise_provider_boundary("contract", error, classify_provider_errors)
+    return False, results
+
+
+async def _execute_retriever_batch(
+    search_retriever,
+    *,
+    max_results: int | None = None,
+    classify_provider_errors: bool = True,
+) -> RetrieverExecutionBatch:
+    """Return one Provider batch without capturing event-loop-owned state."""
+    candidate_capable, payload = await asyncio.to_thread(
+        _run_retriever_once,
+        search_retriever,
+        max_results,
+        classify_provider_errors,
+    )
+    if not candidate_capable:
+        return RetrieverExecutionBatch(
+            projected_results=payload,
+            candidates=(),
+            candidate_capable=False,
+        )
+
+    candidates: tuple[PaperCandidate, ...] = payload
+    try:
+        projected_results = tuple(
+            candidate.to_retriever_result() for candidate in candidates
+        )
+    except Exception as exc:
+        _raise_provider_boundary("contract", exc, classify_provider_errors)
+    return RetrieverExecutionBatch(
+        projected_results=projected_results,
+        candidates=candidates,
+        candidate_capable=True,
+    )
 
 
 async def execute_retriever_search(
@@ -70,19 +155,18 @@ async def execute_retriever_search(
     collector: PaperCandidateCollector | None = None,
 ) -> List[Dict[str, Any]]:
     """Execute one Retriever request and collect candidates after thread return."""
-    candidate_capable, payload = await asyncio.to_thread(
-        _run_retriever_once,
+    batch = await _execute_retriever_batch(
         search_retriever,
-        max_results,
+        max_results=max_results,
+        classify_provider_errors=False,
     )
+    if not batch.candidate_capable:
+        return list(batch.projected_results)
 
-    if not candidate_capable:
-        return payload
-
-    candidates: tuple[PaperCandidate, ...] = payload
+    candidates = batch.candidates
     if collector is not None:
         collector.add_batch(candidates)
-    return [candidate.to_retriever_result() for candidate in candidates]
+    return list(batch.projected_results)
 
 async def get_search_results(
     query: str,

@@ -9,17 +9,101 @@ import asyncio
 import logging
 import os
 import random
+from dataclasses import dataclass
+from typing import Any
 
 from ..actions.agent_creator import choose_agent
 from ..actions.query_processing import (
+    RetrieverBatchError,
+    _execute_retriever_batch,
     execute_retriever_search,
     get_search_results,
     plan_research_outline,
 )
 from ..actions.utils import stream_output
 from ..document import DocumentLoader, LangChainDocumentLoader, OnlineDocumentLoader
+from ..screening.decisions import PaperType, ScreeningPolicy, UnknownValuePolicy
+from ..screening.workspace import ScreeningWorkspace, WorkspaceState
 from ..utils.enum import ReportSource, ReportType
 from ..utils.logging_config import get_json_handler
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedEvidenceRequest:
+    """Private Phase A result consumed by the screened Phase B path."""
+
+    retrieval_request_id: str
+    query: str
+    ordinary_urls: tuple[str, ...]
+    ordinary_prefetched_content: tuple[dict[str, Any], ...]
+    academic_occurrence_ids: tuple[str, ...]
+    mcp_context: tuple[dict[str, Any], ...]
+
+
+_SCREENED_REPORT_TYPES = {
+    ReportType.ResearchReport.value,
+    ReportType.ResourceReport.value,
+    ReportType.OutlineReport.value,
+    ReportType.CustomReport.value,
+}
+
+
+def _strict_screening_enabled(value: Any) -> bool:
+    if not isinstance(value, str):
+        raise ValueError("PAPER_SCREENING_ENABLED must be true or false")
+    normalized = value.strip().casefold()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ValueError("PAPER_SCREENING_ENABLED must be true or false")
+
+
+def _strict_screening_year(value: Any, name: str) -> int | None:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be empty or a four-digit year")
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if not normalized.isascii() or not normalized.isdecimal():
+        raise ValueError(f"{name} must be empty or a four-digit year")
+    year = int(normalized)
+    if year < 1000 or year > 9999:
+        raise ValueError(f"{name} must be between 1000 and 9999")
+    return year
+
+
+def _strict_unknown_policy(value: Any, name: str) -> UnknownValuePolicy:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be include or exclude")
+    normalized = value.strip().casefold()
+    try:
+        return UnknownValuePolicy(normalized)
+    except ValueError:
+        raise ValueError(f"{name} must be include or exclude") from None
+
+
+def _strict_allowed_types(value: Any) -> tuple[PaperType, ...] | None:
+    if not isinstance(value, str):
+        raise ValueError("PAPER_SCREENING_ALLOWED_TYPES must be a string")
+    stripped = value.strip()
+    if not stripped:
+        return None
+    tokens = tuple(item.strip().casefold() for item in value.split(",") if item.strip())
+    if not tokens:
+        raise ValueError("PAPER_SCREENING_ALLOWED_TYPES must contain a paper type")
+    if len(set(tokens)) != len(tokens):
+        raise ValueError("PAPER_SCREENING_ALLOWED_TYPES contains duplicates")
+    allowed = {
+        PaperType.JOURNAL.value: PaperType.JOURNAL,
+        PaperType.CONFERENCE.value: PaperType.CONFERENCE,
+        PaperType.PREPRINT.value: PaperType.PREPRINT,
+        PaperType.REVIEW.value: PaperType.REVIEW,
+        PaperType.BOOK_CHAPTER.value: PaperType.BOOK_CHAPTER,
+    }
+    if any(token not in allowed for token in tokens):
+        raise ValueError("PAPER_SCREENING_ALLOWED_TYPES contains an unsupported type")
+    return tuple(allowed[token] for token in tokens)
 
 
 class ResearchConductor:
@@ -50,6 +134,69 @@ class ResearchConductor:
         self._mcp_cache_lock = asyncio.Lock()
         # Track MCP query count for balanced mode
         self._mcp_query_count = 0
+
+        # Construction cannot distinguish Quick Search from a later full
+        # research run. Screening is bound explicitly by conduct_research().
+        self._reset_paper_screening_binding()
+
+    def _reset_paper_screening_binding(self) -> None:
+        """Replace prior run binding state without reading configuration."""
+        self._paper_screening_entry_eligible = False
+        self._paper_screening_enabled = False
+        self._paper_screening_policy: ScreeningPolicy | None = None
+        self._paper_screening_candidate_capable = False
+
+    def _bind_paper_screening_for_run(self) -> None:
+        """Bind one full-research run after its candidate run guard opens."""
+        self._reset_paper_screening_binding()
+        self._paper_screening_entry_eligible = (
+            getattr(self.researcher, "report_source", None) == ReportSource.Web.value
+            and getattr(self.researcher, "report_type", None)
+            in _SCREENED_REPORT_TYPES
+        )
+        if not self._paper_screening_entry_eligible:
+            return
+
+        self._paper_screening_enabled = _strict_screening_enabled(
+            self.researcher.cfg.paper_screening_enabled
+        )
+        if not self._paper_screening_enabled:
+            return
+
+        min_year = _strict_screening_year(
+            self.researcher.cfg.paper_screening_min_year,
+            "PAPER_SCREENING_MIN_YEAR",
+        )
+        max_year = _strict_screening_year(
+            self.researcher.cfg.paper_screening_max_year,
+            "PAPER_SCREENING_MAX_YEAR",
+        )
+        self._paper_screening_policy = ScreeningPolicy(
+            min_year=min_year,
+            max_year=max_year,
+            unknown_year=_strict_unknown_policy(
+                self.researcher.cfg.paper_screening_unknown_year,
+                "PAPER_SCREENING_UNKNOWN_YEAR",
+            ),
+            allowed_paper_types=_strict_allowed_types(
+                self.researcher.cfg.paper_screening_allowed_types
+            ),
+            unknown_paper_type=_strict_unknown_policy(
+                self.researcher.cfg.paper_screening_unknown_type,
+                "PAPER_SCREENING_UNKNOWN_TYPE",
+            ),
+        )
+        self._paper_screening_candidate_capable = any(
+            callable(getattr(retriever, "search_candidates", None))
+            for retriever in self.researcher.retrievers
+        )
+
+    def _should_use_paper_screening(self) -> bool:
+        return (
+            self._paper_screening_entry_eligible
+            and self._paper_screening_enabled
+            and self._paper_screening_candidate_capable
+        )
 
     async def plan_research(self, query, query_domains=None):
         """Gets the sub-queries from the query
@@ -308,6 +455,11 @@ class ResearchConductor:
         if query_domains is None:
             query_domains = []
 
+        if getattr(self, "_paper_screening_candidate_capable", False) and self._should_use_paper_screening():
+            return await self._get_context_by_screened_web_search(
+                query, scraped_data, query_domains
+            )
+
         # **CONFIGURABLE MCP OPTIMIZATION: Control MCP strategy**
         mcp_retrievers = [r for r in self.researcher.retrievers if "mcpretriever" in r.__name__.lower()]
         
@@ -398,6 +550,306 @@ class ResearchConductor:
         except Exception as e:
             self.logger.error(f"Error during web search: {e}", exc_info=True)
             return []
+
+    def _log_provider_batch_failure(self, source_identifier: str, category: str) -> None:
+        """Log only fixed orchestration labels, never Provider exception data."""
+        self.logger.warning(
+            "paper screening provider batch failed source=%s category=%s",
+            source_identifier,
+            category,
+        )
+
+    async def _prepare_screening_mcp_cache(self, query: str) -> None:
+        mcp_retrievers = [
+            retriever
+            for retriever in self.researcher.retrievers
+            if "mcpretriever" in retriever.__name__.lower()
+        ]
+        strategy = self._get_mcp_strategy()
+        async with self._mcp_cache_lock:
+            if not mcp_retrievers or self._mcp_results_cache is not None:
+                return
+            if strategy == "disabled" or strategy == "deep":
+                return
+            self._mcp_results_cache = await self._execute_mcp_research_for_queries(
+                [query], mcp_retrievers
+            )
+
+    def _instantiate_retriever(self, retriever_class, query, query_domains):
+        if "mcpretriever" in retriever_class.__name__.lower():
+            return retriever_class(
+                query,
+                query_domains=query_domains,
+                researcher=self.researcher,
+            )
+        return retriever_class(query, query_domains=query_domains)
+
+    async def _plan_screened_research(
+        self,
+        query: str,
+        workspace: ScreeningWorkspace,
+        query_domains: list,
+    ) -> list[str]:
+        request_id = "planning:000001"
+        workspace.add_request(request_id, planning_only=True)
+        retriever_class = self.researcher.retrievers[0]
+        source_identifier = getattr(retriever_class, "__name__", "retriever")
+        projected_results = []
+        try:
+            retriever = self._instantiate_retriever(
+                retriever_class, query, query_domains
+            )
+        except Exception:
+            self._log_provider_batch_failure(source_identifier, "call")
+        else:
+            try:
+                batch = await _execute_retriever_batch(
+                    retriever,
+                    max_results=self.researcher.cfg.max_search_results_per_query,
+                )
+            except RetrieverBatchError as error:
+                self._log_provider_batch_failure(source_identifier, error.category)
+            else:
+                projected_results = list(batch.projected_results or ())
+                if batch.candidate_capable:
+                    collector = getattr(
+                        self.researcher, "_paper_candidate_collector", None
+                    )
+                    if collector is not None:
+                        collector.add_batch(batch.candidates)
+                    workspace.add_candidates(
+                        request_id,
+                        True,
+                        1,
+                        batch.candidates,
+                    )
+
+        retriever_names = [item.__name__ for item in self.researcher.retrievers]
+        return await plan_research_outline(
+            query=query,
+            search_results=projected_results,
+            agent_role_prompt=self.researcher.role,
+            cfg=self.researcher.cfg,
+            parent_query=self.researcher.parent_query,
+            report_type=self.researcher.report_type,
+            cost_callback=self.researcher.add_costs,
+            retriever_names=retriever_names,
+            **self.researcher.kwargs,
+        )
+
+    async def _prepare_evidence_request(
+        self,
+        retrieval_request_id: str,
+        query: str,
+        workspace: ScreeningWorkspace,
+        scraped_data: list,
+        query_domains: list,
+    ) -> PreparedEvidenceRequest:
+        mcp_retrievers = [
+            retriever
+            for retriever in self.researcher.retrievers
+            if "mcpretriever" in retriever.__name__.lower()
+        ]
+        non_mcp_retrievers = [
+            retriever
+            for retriever in self.researcher.retrievers
+            if "mcpretriever" not in retriever.__name__.lower()
+        ]
+        if self._tavily_mcp_redundant_with_direct(
+            mcp_retrievers, non_mcp_retrievers
+        ):
+            mcp_retrievers = []
+
+        mcp_context: list[dict[str, Any]] = []
+        strategy = self._get_mcp_strategy()
+        if mcp_retrievers:
+            if strategy == "fast" and self._mcp_results_cache is not None:
+                mcp_context = list(self._mcp_results_cache)
+            elif strategy == "deep":
+                mcp_context = await self._execute_mcp_research_for_queries(
+                    [query], mcp_retrievers
+                )
+            elif strategy != "disabled":
+                mcp_context = await self._execute_mcp_research_for_queries(
+                    [query], mcp_retrievers
+                )
+
+        ordinary_urls: list[str] = []
+        ordinary_prefetched: list[dict[str, Any]] = list(scraped_data or ())
+        academic_occurrence_ids: list[str] = []
+        if not scraped_data:
+            for retriever_index, retriever_class in enumerate(
+                self.researcher.retrievers, start=1
+            ):
+                if "mcpretriever" in retriever_class.__name__.lower():
+                    continue
+                source_identifier = getattr(
+                    retriever_class, "__name__", "retriever"
+                )
+                try:
+                    retriever = self._instantiate_retriever(
+                        retriever_class, query, query_domains
+                    )
+                except Exception:
+                    self._log_provider_batch_failure(source_identifier, "call")
+                    continue
+                try:
+                    batch = await _execute_retriever_batch(
+                        retriever,
+                        max_results=self.researcher.cfg.max_search_results_per_query,
+                    )
+                except RetrieverBatchError as error:
+                    self._log_provider_batch_failure(
+                        source_identifier, error.category
+                    )
+                    continue
+
+                if batch.candidate_capable:
+                    collector = getattr(
+                        self.researcher, "_paper_candidate_collector", None
+                    )
+                    if collector is not None:
+                        collector.add_batch(batch.candidates)
+                    occurrence_ids = workspace.add_candidates(
+                        retrieval_request_id,
+                        False,
+                        retriever_index,
+                        batch.candidates,
+                    )
+                    academic_occurrence_ids.extend(occurrence_ids)
+                    continue
+
+                batch_urls: list[str] = []
+                batch_prefetched: list[dict[str, Any]] = []
+                batch_sources: list[dict[str, str]] = []
+                try:
+                    for result in batch.projected_results or ():
+                        if not isinstance(result, dict):
+                            raise TypeError("ordinary result must be a dictionary")
+                        url = result.get("href") or result.get("url")
+                        raw_content = result.get("raw_content")
+                        if url and raw_content and len(raw_content) > 100:
+                            batch_prefetched.append(
+                                {"url": url, "raw_content": raw_content}
+                            )
+                            batch_sources.append({"url": url})
+                        elif url:
+                            batch_urls.append(url)
+                except Exception:
+                    self._log_provider_batch_failure(
+                        source_identifier, "contract"
+                    )
+                    continue
+                ordinary_urls.extend(batch_urls)
+                ordinary_prefetched.extend(batch_prefetched)
+                if batch_sources:
+                    self.researcher.add_research_sources(batch_sources)
+
+        return PreparedEvidenceRequest(
+            retrieval_request_id=retrieval_request_id,
+            query=query,
+            ordinary_urls=tuple(ordinary_urls),
+            ordinary_prefetched_content=tuple(ordinary_prefetched),
+            academic_occurrence_ids=tuple(academic_occurrence_ids),
+            mcp_context=tuple(mcp_context),
+        )
+
+    async def _consume_prepared_evidence(
+        self,
+        prepared: PreparedEvidenceRequest,
+        workspace: ScreeningWorkspace,
+    ) -> str:
+        canonical_ids = workspace.route_for(prepared.retrieval_request_id)
+        routed_academic: list[dict[str, str]] = []
+        for occurrence_id in canonical_ids:
+            candidate = workspace.canonical_candidate(occurrence_id)
+            routed_academic.append(
+                {"url": candidate.href, "raw_content": candidate.body}
+            )
+
+        try:
+            ordinary_urls = await self._get_new_urls(list(prepared.ordinary_urls))
+            random.shuffle(ordinary_urls)
+            scraped_content = await self.researcher.scraper_manager.browse_urls(
+                ordinary_urls
+            )
+            scraped_content.extend(
+                dict(item) for item in prepared.ordinary_prefetched_content
+            )
+            scraped_content.extend(routed_academic)
+            if routed_academic:
+                self.researcher.add_research_sources(
+                    [{"url": item["url"]} for item in routed_academic]
+                )
+            if self.researcher.vector_store:
+                self.researcher.vector_store.load(scraped_content)
+            web_context = ""
+            if scraped_content:
+                web_context = await self.researcher.context_manager.get_similar_content_by_query(
+                    prepared.query, scraped_content
+                )
+            return self._combine_mcp_and_web_context(
+                list(prepared.mcp_context), web_context, prepared.query
+            )
+        except Exception:
+            self.logger.error(
+                "paper screening Phase B request failed category=request_external"
+            )
+            return ""
+
+    async def _get_context_by_screened_web_search(
+        self,
+        query: str,
+        scraped_data: list,
+        query_domains: list,
+    ):
+        if self._paper_screening_policy is None:
+            raise RuntimeError("screening policy is not bound")
+        workspace = ScreeningWorkspace(self._paper_screening_policy)
+        try:
+            await self._prepare_screening_mcp_cache(query)
+            sub_queries = await self._plan_screened_research(
+                query, workspace, query_domains
+            )
+            sub_queries = list(sub_queries)
+            sub_queries.append(query)
+            request_items = tuple(
+                (f"evidence:{index:06d}", sub_query)
+                for index, sub_query in enumerate(sub_queries, start=1)
+            )
+            for request_id, _sub_query in request_items:
+                workspace.add_request(request_id, planning_only=False)
+
+            prepared_requests = await asyncio.gather(
+                *[
+                    self._prepare_evidence_request(
+                        request_id,
+                        sub_query,
+                        workspace,
+                        scraped_data,
+                        query_domains,
+                    )
+                    for request_id, sub_query in request_items
+                ]
+            )
+            workspace.screen()
+            contexts = await asyncio.gather(
+                *[
+                    self._consume_prepared_evidence(prepared, workspace)
+                    for prepared in prepared_requests
+                ]
+            )
+            workspace.finalize()
+            contexts = [context for context in contexts if context]
+            return " ".join(contexts) if contexts else []
+        except asyncio.CancelledError:
+            if workspace.state in (WorkspaceState.OPEN, WorkspaceState.SCREENED):
+                workspace.abort()
+            raise
+        except Exception:
+            if workspace.state in (WorkspaceState.OPEN, WorkspaceState.SCREENED):
+                workspace.abort()
+            raise
 
     def _get_mcp_strategy(self) -> str:
         """

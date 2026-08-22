@@ -408,6 +408,9 @@ class GPTResearcher:
             self._begin_paper_candidate_run()
 
         try:
+            research_conductor = getattr(self, "research_conductor", None)
+            if research_conductor is not None:
+                research_conductor._bind_paper_screening_for_run()
             result = await self._conduct_research_impl(on_progress)
             if owns_run:
                 self._finalize_paper_candidate_run()

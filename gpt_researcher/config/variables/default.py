@@ -46,6 +46,14 @@ DEFAULT_CONFIG: BaseConfig = {
     "MCP_ALLOWED_ROOT_PATHS": [],  # List of allowed root paths for local file access
     "MCP_STRATEGY": "fast",  # MCP execution strategy: "fast", "deep", "disabled"
     "REASONING_EFFORT": "medium",
+
+    # Basic/Web deterministic paper screening (disabled by default)
+    "PAPER_SCREENING_ENABLED": "false",
+    "PAPER_SCREENING_MIN_YEAR": "",
+    "PAPER_SCREENING_MAX_YEAR": "",
+    "PAPER_SCREENING_UNKNOWN_YEAR": "include",
+    "PAPER_SCREENING_ALLOWED_TYPES": "",
+    "PAPER_SCREENING_UNKNOWN_TYPE": "include",
     
     # Image generation settings (optional - requires GOOGLE_API_KEY)
     # Free tier models: gemini-2.5-flash-image, gemini-2.0-flash-exp-image-generation
