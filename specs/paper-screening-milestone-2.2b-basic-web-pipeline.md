@@ -2,13 +2,12 @@
 
 Status: **Approved and frozen**
 
-This standalone specification has completed review and received explicit
-implementation approval for the Basic/Web integration of the Approved and
-frozen Milestone 2.2A deterministic screening engine. Implementation is
-authorized only within the technical design and complete frozen eight-file
-boundary defined here. Any need to modify a ninth file, a protected file, or
-any other frozen boundary or behavior requires implementation to stop and this
-specification to be revised, reviewed, and explicitly approved again.
+This revised standalone specification has completed re-review and received
+explicit implementation approval. Implementation is authorized only within the
+revised technical design and complete frozen nine-file boundary defined here.
+Any need to modify a tenth file, a protected file, or another frozen boundary or
+behavior requires implementation to stop and this specification to be revised,
+reviewed, and explicitly approved again.
 
 Milestone 2.2B is limited to a run/web-pass-scoped, two-stage Basic/Web
 research pipeline. It collects structured academic occurrences before context
@@ -67,6 +66,12 @@ Eligibility is determined in the shared `GPTResearcher` Basic/Web core call
 chain. The WebSocket `BasicReport` wrapper class name is not a capability or
 scope test. Direct Python and CLI callers that use the same eligible
 `GPTResearcher` source/type combination receive the same behavior.
+
+Source and type alone are not sufficient at `GPTResearcher` construction time:
+the same default `report_source=web` and `report_type=research_report` instance
+may later execute either `quick_search()` or `conduct_research()`. Entry-scope
+evaluation and screening binding therefore occur only for a
+`conduct_research()` run. `quick_search()` never enters the binding path.
 
 The following remain unchanged and outside Milestone 2.2B:
 
@@ -165,47 +170,78 @@ controlled only by `PAPER_SCREENING_UNKNOWN_TYPE`.
 
 ### 4.5 Parse timing and ownership
 
-`ResearchConductor.__init__` is the single screening runtime-configuration
-binding point. It runs after project Config and Retriever class selection are
-available and before `GPTResearcher` issues a research Provider, LLM, scraper,
-or compressor request.
+`ResearchConductor.__init__` must not read, parse, or validate any
+`PAPER_SCREENING_*` configuration and must not execute the candidate-capability
+gate. Construction alone cannot determine whether the caller will later use
+Quick Search or full research.
+
+The single screening runtime-configuration binding mechanism is the private
+`ResearchConductor._bind_paper_screening_for_run()` method. It is called only by
+`GPTResearcher.conduct_research()`:
+
+- after the existing paper-candidate run guard has established the owned run,
+  or after the existing borrower determination for a borrowed run;
+- inside the existing `conduct_research()` `try` scope; and
+- immediately before `_conduct_research_impl()`.
+
+Consequently, binding occurs before `_conduct_research_impl()` can perform
+`choose_agent`, Planning, Provider, MCP, LLM, scraper, or compressor activity.
 
 The binding order is frozen:
 
-1. First evaluate only the exact `report_source` and `report_type` eligibility
-   predicate in Section 3.
-2. If the source/type combination is out of scope, do not read or parse
+1. First replace all prior per-run screening binding state with a fresh inactive
+   state without reading screening configuration.
+2. Then evaluate only the exact `report_source` and `report_type` eligibility
+   predicate in Section 3 for this `conduct_research()` run.
+3. If the source/type combination is out of scope, do not read or parse
    `PAPER_SCREENING_ENABLED` or any other screening configuration, do not
    construct a `ScreeningPolicy`, and do not execute the candidate-capability
    gate.
-3. For an eligible Basic/Web combination, strictly parse
+4. For an eligible Basic/Web combination, strictly parse
    `PAPER_SCREENING_ENABLED`.
-4. If enabled is false, record only the eligible-but-disabled state, do not
+5. If enabled is false, record only the eligible-but-disabled state, do not
    parse the remaining policy configuration, and use the exact old path.
-5. If enabled is true, parse and validate every remaining screening key once
+6. If enabled is true, parse and validate every remaining screening key once
    and construct one frozen Milestone 2.2A `ScreeningPolicy`.
-6. Only after the complete enabled policy is valid may the conductor evaluate
+7. Only after the complete enabled policy is valid may the conductor evaluate
    the candidate-capability gate.
 
-Consequently, an invalid screening environment must have no initialization or
-runtime effect on Quick, Hybrid, Local, Azure, LangChain, Deep, Detailed,
-Subtopic, or other out-of-scope modes. Conversely, invalid enabled policy for
-an eligible Basic/Web run is fatal even if no configured Retriever is
-candidate-capable.
+The binding reads only the raw screening values already bound on the run's
+project `Config`. It must not re-read `os.environ` or any other live process
+environment during the run. A later non-overlapping `conduct_research()` call
+on the same `GPTResearcher` invokes the binding again and must not reuse the
+previous run's enabled flag, policy, capability result, or Workspace state.
+
+An invalid screening configuration must have no construction-time or runtime
+effect on Quick, Hybrid, Local, Azure, LangChain, Deep, Detailed, Subtopic, or
+other out-of-scope modes. Those modes first fail the exact run-scope predicate
+and bypass every screening configuration property read. Conversely, invalid
+enabled policy for an eligible Basic/Web full-research run is fatal even if no
+configured Retriever is candidate-capable.
 
 - If enabled is false, no `ScreeningPolicy` is built.
 - If enabled is true, the complete policy is validated before capability
   discovery or any external activity.
-- Any invalid enabled configuration fails fast during conductor construction,
+- Any invalid enabled configuration fails from the private run-binding method
   before Planning, agent selection, MCP, Provider, LLM, scraper, or compressor
   activity.
+- The original binding exception propagates unchanged through
+  `conduct_research()`.
+- When an owning `conduct_research()` run has already created its Milestone 2.1
+  Collector, a binding failure follows the existing `try`/`except` lifecycle:
+  the open Collector is aborted and the active-run flag is cleared.
 - Every eligible web-pass Workspace owned by that conductor receives the same
   frozen policy object.
 - Provider workers, `ScreeningWorkspace`, and the 2.2A engine do not read
   environment variables or project Config.
 
-This binding uses only the frozen implementation files. It does not require a
-change to `agent.py` or `config.py`.
+`GPTResearcher.quick_search()` does not call
+`_bind_paper_screening_for_run()`. It reads no screening configuration, creates
+no screening policy or Workspace, performs no candidate-capability gate, and
+retains its existing Provider calls, exact three-key results, and Milestone 2.1
+Collector lifecycle. The existing overlap guard also remains earlier than any
+binding-state replacement, so a rejected overlapping run cannot disturb the
+active run.
 
 ## 5. Candidate-capability gate
 
@@ -226,7 +262,7 @@ eligible-but-disabled runs do not perform this gate.
 - Ordinary Retriever concurrency, MCP handling, scraping, compression,
   source tracking, and output remain unchanged.
 
-Complete configuration validation still occurs at the frozen constructor
+Complete configuration validation still occurs at the frozen private run-
 binding point before this gate. The no-academic gate controls pipeline
 selection, not whether invalid enabled configuration may be ignored.
 
@@ -651,6 +687,12 @@ academic content. None may be converted to an empty Provider batch.
 - A successful pass changes SCREENED to FINALIZED exactly once.
 - A later eligible web pass creates an entirely new OPEN Workspace.
 - A new pass contains no prior request metadata, occurrence, route, or result.
+- Every non-overlapping `conduct_research()` run first creates fresh inactive
+  screening binding state and then applies the Section 4.5 binding order.
+- Consecutive runs on one `GPTResearcher` do not reuse the previous run's
+  enabled flag, policy, candidate-capability result, or Workspace.
+- The existing overlap guard rejects an overlapping run before any screening
+  binding state is replaced or mutated.
 - Existing Milestone 2.1 Collector ownership, finalization, abort, and snapshot
   timing remain unchanged.
 
@@ -689,16 +731,16 @@ Implementation may modify only:
 - `.env.example`;
 - `gpt_researcher/config/variables/base.py`;
 - `gpt_researcher/config/variables/default.py`;
-- `gpt_researcher/actions/query_processing.py`; and
-- `gpt_researcher/skills/researcher.py`.
+- `gpt_researcher/actions/query_processing.py`;
+- `gpt_researcher/skills/researcher.py`; and
+- `gpt_researcher/agent.py`.
 
-These are the complete eight implementation files. Apart from a separately
+These are the complete nine implementation files. Apart from a separately
 approved status-only update to this specification, implementation must not
 modify any other file.
 
 Protected files and areas include:
 
-- `gpt_researcher/agent.py`;
 - `gpt_researcher/screening/models.py`;
 - `gpt_researcher/screening/collection.py`;
 - `gpt_researcher/screening/decisions.py`;
@@ -709,7 +751,7 @@ Protected files and areas include:
 - dependency and lock files; and
 - every Approved and frozen specification.
 
-If implementation requires any ninth file or any protected method, work must
+If implementation requires any tenth file or any protected method, work must
 stop. This Draft must be revised, reviewed, and explicitly approved again.
 
 ## 17. Fully mocked test matrix
@@ -721,8 +763,15 @@ environment variables.
 
 ### 17.1 Configuration
 
+- `ResearchConductor.__init__` does not read any screening configuration or run
+  the candidate-capability gate;
+- a default Web/Research `GPTResearcher` with invalid screening configuration
+  can execute `quick_search()` normally;
+- Quick Search does not read any `PAPER_SCREENING_*` Config property and does
+  not call the private run-binding method, Workspace, or engine;
 - out-of-scope source/type combinations do not read or parse any screening
-  configuration, even when screening environment values are invalid;
+  configuration during `conduct_research()`, even when screening values are
+  invalid;
 - default disabled behavior;
 - exact true/false normalization and rejection of every other token;
 - empty and valid min/max years;
@@ -733,10 +782,12 @@ environment variables.
 - comma-only invalid input;
 - duplicate and unsupported type rejection;
 - `unknown` rejection;
-- eligible Web plus enabled=true invalid policy fails before any fake Provider,
-  LLM, scraper, or compressor call;
+- eligible Web plus enabled=true invalid policy fails before `choose_agent` and
+  before any fake Provider, MCP, LLM, scraper, or compressor call;
 - entry scope is checked before enabled parsing, enabled is checked before full
   policy parsing, and full policy parsing precedes capability discovery;
+- binding failure propagates the original exception and aborts the already-open
+  owning Milestone 2.1 Collector through the existing run lifecycle;
 - disabled creates no policy or Workspace; and
 - the same frozen policy object is used for the whole web pass.
 
@@ -838,6 +889,9 @@ environment variables.
 
 ### 17.7 Bypass and entry guards
 
+- constructing a default Web/Research `GPTResearcher` does not bind screening;
+- Quick Search never invokes run binding, Workspace, or the screening engine,
+  even when its screening configuration is invalid;
 - default disabled mode follows the exact old call path;
 - explicitly disabled mode follows the exact old call path;
 - enabled mode with no candidate-capable Retriever follows the exact old call
@@ -846,6 +900,13 @@ environment variables.
 - eligible Research, Resource, Outline, and Custom Web reports use two stages;
 - Quick, Hybrid, Local, Azure, LangChain, Deep, Detailed, Subtopic, and
   multi-agent paths remain unchanged;
+- out-of-scope `conduct_research()` calls bypass every screening configuration
+  read before using their existing path;
+- consecutive non-overlapping `conduct_research()` runs on one instance create
+  fresh binding state and never reuse the prior enabled, policy, capability, or
+  Workspace state;
+- the existing overlap guard rejects a concurrent run before replacing any
+  run-binding state;
 - explicit source URLs remain unchanged while only the complement Web pass is
   screened; and
 - capability detection never names arXiv or Semantic Scholar.
@@ -900,16 +961,26 @@ Configuration and scope:
 
 - [ ] Every configuration key, default, normalization, token, range, and error
   behavior matches Section 4.
-- [ ] Enabled configuration is parsed once and fails fast before any Provider,
-  LLM, scraper, or compressor request.
-- [ ] Exact entry scope is checked before reading any screening configuration,
-  so invalid screening environment has no effect on out-of-scope modes.
+- [ ] `ResearchConductor.__init__` reads no screening configuration and performs
+  no candidate-capability gate.
+- [ ] Each eligible `conduct_research()` run binds enabled configuration once
+  and fails fast before `choose_agent`, Provider, MCP, LLM, scraper, or
+  compressor activity.
+- [ ] Exact run entry scope is checked before reading any screening
+  configuration, so invalid screening values have no effect on out-of-scope
+  modes.
+- [ ] Quick Search reads no screening configuration and never calls binding,
+  Workspace, or the engine, including for default Web/Research instances.
 - [ ] Eligible disabled runs stop after strict enabled parsing; eligible enabled
   runs validate the complete policy before capability discovery.
 - [ ] Only the four frozen Basic/Web report types are eligible.
 - [ ] Disabled and no-academic paths exactly bypass Workspace, IDs, and engine.
 - [ ] Quick, Hybrid, Local, Azure, LangChain, Deep, Detailed, Subtopic, and
   multi-agent behavior remains unchanged.
+- [ ] Binding failure propagates unchanged and aborts the already-open owning
+  Collector through the existing `conduct_research()` lifecycle.
+- [ ] Consecutive runs receive fresh binding state, while the overlap guard
+  rejects a concurrent run before replacing active state.
 - [ ] Explicit source URLs remain unchanged and only their complement Web pass
   is screened.
 
@@ -979,7 +1050,7 @@ Compatibility, tests, and boundary:
 - [ ] Both new fully mocked test files cover the complete frozen matrix.
 - [ ] Fail-fast test guards prevent real Provider, network, LLM, scraper, and
   compressor calls.
-- [ ] Only the frozen eight implementation files change.
+- [ ] Only the frozen nine implementation files change.
 - [ ] No implementation starts while this specification remains Draft.
 - [ ] No dependency is installed, no real-network test is run, and no file is
   staged or committed as part of this Draft.
