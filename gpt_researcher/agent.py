@@ -23,6 +23,13 @@ from .llm_provider import GenericLLMProvider
 from .memory import Memory
 from .prompts import get_prompt_family
 from .screening.collection import CollectorState, PaperCandidateCollector
+from .screening.audit import (
+    AUDIT_UNAVAILABLE_MESSAGE,
+    AuditCollectorState,
+    PaperScreeningAuditCollector,
+    PaperScreeningAuditSnapshot,
+)
+from .screening.decisions import ScreeningPolicy
 from .screening.models import PaperCandidate
 from .skills.browser import BrowserManager
 from .skills.context_manager import ContextManager
@@ -176,6 +183,8 @@ class GPTResearcher:
         self._paper_candidate_collector_owner = False
         self._paper_candidate_collector_borrower = False
         self._paper_candidate_run_active = False
+        self._paper_screening_audit_collector: PaperScreeningAuditCollector | None = None
+        self._paper_screening_audit_run_ordinal = 0
         if _paper_candidate_collector is not None:
             if _paper_candidate_collector_owner:
                 raise ValueError("injected paper candidate collectors must be borrowed")
@@ -268,6 +277,56 @@ class GPTResearcher:
         if self._paper_candidate_collector is None:
             raise RuntimeError("no paper candidate run is available")
         return self._paper_candidate_collector.snapshot()
+
+    def _clear_paper_screening_audit_for_conduct_run(self) -> None:
+        """Hide the prior audit after the conduct-only overlap guard succeeds."""
+        self._paper_screening_audit_collector = None
+
+    def _begin_paper_screening_audit_run(
+        self,
+        policy: ScreeningPolicy,
+        *,
+        topic_relevance_enabled: bool,
+    ) -> None:
+        """Create the audit collector only after all frozen runtime gates pass."""
+        next_ordinal = getattr(
+            self, "_paper_screening_audit_run_ordinal", 0
+        ) + 1
+        collector = PaperScreeningAuditCollector(
+            run_ordinal=next_ordinal,
+            policy=policy,
+            topic_relevance_enabled=topic_relevance_enabled,
+        )
+        self._paper_screening_audit_run_ordinal = next_ordinal
+        self._paper_screening_audit_collector = collector
+
+    def _abort_owned_paper_run_collectors(self) -> None:
+        """Best-effort independent cleanup that cannot replace a primary error."""
+        audit_collector = getattr(self, "_paper_screening_audit_collector", None)
+        if (
+            audit_collector is not None
+            and audit_collector.state is AuditCollectorState.OPEN
+        ):
+            try:
+                audit_collector.abort()
+            except BaseException:
+                pass
+        candidate_collector = getattr(self, "_paper_candidate_collector", None)
+        if (
+            candidate_collector is not None
+            and candidate_collector.state is CollectorState.OPEN
+        ):
+            try:
+                candidate_collector.abort()
+            except BaseException:
+                pass
+
+    def get_paper_screening_audit(self) -> PaperScreeningAuditSnapshot:
+        """Return only the latest successfully finalized immutable audit."""
+        collector = getattr(self, "_paper_screening_audit_collector", None)
+        if collector is None:
+            raise RuntimeError(AUDIT_UNAVAILABLE_MESSAGE)
+        return collector.snapshot()
     
     def _generate_research_id(self) -> str:
         """Generate a unique research ID for this session.
@@ -406,23 +465,47 @@ class GPTResearcher:
         )
         if owns_run:
             self._begin_paper_candidate_run()
+            self._clear_paper_screening_audit_for_conduct_run()
 
         try:
             research_conductor = getattr(self, "research_conductor", None)
             if research_conductor is not None:
                 research_conductor._bind_paper_screening_for_run()
+                if (
+                    owns_run
+                    and self.report_source == ReportSource.Web.value
+                    and self.report_type == ReportType.ResearchReport.value
+                    and research_conductor._should_use_paper_screening()
+                ):
+                    policy = research_conductor._paper_screening_policy
+                    if policy is None:
+                        raise RuntimeError("screening policy is not bound")
+                    self._begin_paper_screening_audit_run(
+                        policy,
+                        topic_relevance_enabled=(
+                            research_conductor._paper_topic_relevance_enabled
+                        ),
+                    )
             result = await self._conduct_research_impl(on_progress)
             if owns_run:
-                self._finalize_paper_candidate_run()
+                audit_collector = self._paper_screening_audit_collector
+                if audit_collector is not None:
+                    audit_collector.prepare()
+                self._paper_candidate_collector.finalize()
+                if audit_collector is not None:
+                    audit_collector.commit()
             return result
         except asyncio.CancelledError:
             if owns_run:
-                self._abort_paper_candidate_run()
+                self._abort_owned_paper_run_collectors()
             raise
         except Exception:
             if owns_run:
-                self._abort_paper_candidate_run()
+                self._abort_owned_paper_run_collectors()
             raise
+        finally:
+            if owns_run:
+                self._paper_candidate_run_active = False
 
     async def _conduct_research_impl(self, on_progress=None):
         """Conduct the research process.

@@ -22,6 +22,13 @@ from ..actions.query_processing import (
 )
 from ..actions.utils import stream_output
 from ..document import DocumentLoader, LangChainDocumentLoader, OnlineDocumentLoader
+from ..screening.audit import (
+    PaperScreeningProviderWarning,
+    PaperScreeningRequestMetadata,
+    ProviderWarningCategory,
+    build_paper_screening_provider_warning,
+    build_paper_screening_web_pass_audit,
+)
 from ..screening.decisions import PaperType, ScreeningPolicy, UnknownValuePolicy
 from ..screening.workspace import ScreeningWorkspace, WorkspaceState
 from ..utils.enum import ReportSource, ReportType
@@ -38,6 +45,13 @@ class PreparedEvidenceRequest:
     ordinary_prefetched_content: tuple[dict[str, Any], ...]
     academic_occurrence_ids: tuple[str, ...]
     mcp_context: tuple[dict[str, Any], ...]
+    provider_warnings: tuple[PaperScreeningProviderWarning, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _ScreenedPlanningResult:
+    sub_queries: tuple[str, ...]
+    request_metadata: PaperScreeningRequestMetadata
 
 
 _SCREENED_REPORT_TYPES = {
@@ -591,6 +605,24 @@ class ResearchConductor:
             category,
         )
 
+    def _capture_paper_screening_provider_warning(
+        self,
+        warnings: list[PaperScreeningProviderWarning],
+        retriever: object | None,
+        retriever_index: int,
+        category: ProviderWarningCategory,
+    ) -> None:
+        """Collect safe warning metadata only for an active top-level audit."""
+        if getattr(self.researcher, "_paper_screening_audit_collector", None) is None:
+            return
+        warnings.append(
+            build_paper_screening_provider_warning(
+                retriever,
+                retriever_index,
+                category,
+            )
+        )
+
     async def _prepare_screening_mcp_cache(self, query: str) -> None:
         mcp_retrievers = [
             retriever
@@ -621,18 +653,26 @@ class ResearchConductor:
         query: str,
         workspace: ScreeningWorkspace,
         query_domains: list,
-    ) -> list[str]:
+    ) -> _ScreenedPlanningResult:
         request_id = "planning:000001"
         workspace.add_request(request_id, planning_only=True)
         retriever_class = self.researcher.retrievers[0]
         source_identifier = getattr(retriever_class, "__name__", "retriever")
         projected_results = []
+        provider_warnings: list[PaperScreeningProviderWarning] = []
+        retriever = None
         try:
             retriever = self._instantiate_retriever(
                 retriever_class, query, query_domains
             )
         except Exception:
             self._log_provider_batch_failure(source_identifier, "call")
+            self._capture_paper_screening_provider_warning(
+                provider_warnings,
+                None,
+                1,
+                ProviderWarningCategory.CALL,
+            )
         else:
             try:
                 batch = await _execute_retriever_batch(
@@ -641,6 +681,12 @@ class ResearchConductor:
                 )
             except RetrieverBatchError as error:
                 self._log_provider_batch_failure(source_identifier, error.category)
+                self._capture_paper_screening_provider_warning(
+                    provider_warnings,
+                    retriever,
+                    1,
+                    ProviderWarningCategory(error.category),
+                )
             else:
                 projected_results = list(batch.projected_results or ())
                 if batch.candidate_capable:
@@ -657,7 +703,7 @@ class ResearchConductor:
                     )
 
         retriever_names = [item.__name__ for item in self.researcher.retrievers]
-        return await plan_research_outline(
+        sub_queries = await plan_research_outline(
             query=query,
             search_results=projected_results,
             agent_role_prompt=self.researcher.role,
@@ -667,6 +713,15 @@ class ResearchConductor:
             cost_callback=self.researcher.add_costs,
             retriever_names=retriever_names,
             **self.researcher.kwargs,
+        )
+        return _ScreenedPlanningResult(
+            sub_queries=tuple(sub_queries),
+            request_metadata=PaperScreeningRequestMetadata(
+                retrieval_request_id=request_id,
+                planning_only=True,
+                retrieval_query=query,
+                provider_warnings=tuple(provider_warnings),
+            ),
         )
 
     async def _prepare_evidence_request(
@@ -709,6 +764,7 @@ class ResearchConductor:
         ordinary_urls: list[str] = []
         ordinary_prefetched: list[dict[str, Any]] = list(scraped_data or ())
         academic_occurrence_ids: list[str] = []
+        provider_warnings: list[PaperScreeningProviderWarning] = []
         if not scraped_data:
             for retriever_index, retriever_class in enumerate(
                 self.researcher.retrievers, start=1
@@ -724,6 +780,12 @@ class ResearchConductor:
                     )
                 except Exception:
                     self._log_provider_batch_failure(source_identifier, "call")
+                    self._capture_paper_screening_provider_warning(
+                        provider_warnings,
+                        None,
+                        retriever_index,
+                        ProviderWarningCategory.CALL,
+                    )
                     continue
                 try:
                     batch = await _execute_retriever_batch(
@@ -733,6 +795,12 @@ class ResearchConductor:
                 except RetrieverBatchError as error:
                     self._log_provider_batch_failure(
                         source_identifier, error.category
+                    )
+                    self._capture_paper_screening_provider_warning(
+                        provider_warnings,
+                        retriever,
+                        retriever_index,
+                        ProviderWarningCategory(error.category),
                     )
                     continue
 
@@ -771,6 +839,12 @@ class ResearchConductor:
                     self._log_provider_batch_failure(
                         source_identifier, "contract"
                     )
+                    self._capture_paper_screening_provider_warning(
+                        provider_warnings,
+                        retriever,
+                        retriever_index,
+                        ProviderWarningCategory.CONTRACT,
+                    )
                     continue
                 ordinary_urls.extend(batch_urls)
                 ordinary_prefetched.extend(batch_prefetched)
@@ -784,6 +858,19 @@ class ResearchConductor:
             ordinary_prefetched_content=tuple(ordinary_prefetched),
             academic_occurrence_ids=tuple(academic_occurrence_ids),
             mcp_context=tuple(mcp_context),
+            provider_warnings=tuple(
+                sorted(
+                    provider_warnings,
+                    key=lambda warning: (
+                        warning.retriever_index,
+                        {
+                            ProviderWarningCategory.CALL: 0,
+                            ProviderWarningCategory.MATERIALIZATION: 1,
+                            ProviderWarningCategory.CONTRACT: 2,
+                        }[warning.category],
+                    ),
+                )
+            ),
         )
 
     async def _consume_prepared_evidence(
@@ -844,12 +931,29 @@ class ResearchConductor:
         if self._paper_screening_policy is None:
             raise RuntimeError("screening policy is not bound")
         workspace = ScreeningWorkspace(self._paper_screening_policy)
+        audit_collector = getattr(
+            self.researcher, "_paper_screening_audit_collector", None
+        )
+        audit_pass_ref = (
+            None if audit_collector is None else audit_collector.allocate_web_pass()
+        )
         try:
             await self._prepare_screening_mcp_cache(query)
-            sub_queries = await self._plan_screened_research(
+            planning_result = await self._plan_screened_research(
                 query, workspace, query_domains
             )
-            sub_queries = list(sub_queries)
+            if isinstance(planning_result, _ScreenedPlanningResult):
+                sub_queries = list(planning_result.sub_queries)
+                planning_metadata = planning_result.request_metadata
+            else:
+                # Preserve compatibility with existing isolated test doubles.
+                sub_queries = list(planning_result)
+                planning_metadata = PaperScreeningRequestMetadata(
+                    retrieval_request_id="planning:000001",
+                    planning_only=True,
+                    retrieval_query=query,
+                    provider_warnings=(),
+                )
             sub_queries.append(query)
             request_items = tuple(
                 (f"evidence:{index:06d}", sub_query)
@@ -871,6 +975,7 @@ class ResearchConductor:
                 ]
             )
             deterministic_result = workspace.screen()
+            topic_result = None
             if self._paper_topic_relevance_enabled:
                 from ..actions.paper_relevance import assess_topic_relevance
 
@@ -905,9 +1010,36 @@ class ResearchConductor:
                         for prepared in prepared_requests
                     ]
                 )
-            workspace.finalize()
+            if audit_collector is None:
+                workspace.finalize()
+                contexts = [context for context in contexts if context]
+                return " ".join(contexts) if contexts else []
+
             contexts = [context for context in contexts if context]
-            return " ".join(contexts) if contexts else []
+            completed_context = " ".join(contexts) if contexts else []
+            if audit_pass_ref is None:
+                raise RuntimeError("audit pass identity is not allocated")
+            request_metadata = (planning_metadata,) + tuple(
+                PaperScreeningRequestMetadata(
+                    retrieval_request_id=prepared.retrieval_request_id,
+                    planning_only=False,
+                    retrieval_query=prepared.query,
+                    provider_warnings=prepared.provider_warnings,
+                )
+                for prepared in prepared_requests
+            )
+            pass_audit = build_paper_screening_web_pass_audit(
+                web_pass_order=audit_pass_ref.web_pass_order,
+                web_pass_id=audit_pass_ref.web_pass_id,
+                policy=self._paper_screening_policy,
+                topic_relevance_enabled=self._paper_topic_relevance_enabled,
+                deterministic_result=deterministic_result,
+                topic_result=topic_result,
+                request_metadata=request_metadata,
+            )
+            audit_collector.add_pass(pass_audit)
+            workspace.finalize()
+            return completed_context
         except asyncio.CancelledError:
             if workspace.state in (WorkspaceState.OPEN, WorkspaceState.SCREENED):
                 workspace.abort()
