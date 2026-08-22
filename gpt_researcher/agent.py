@@ -7,7 +7,8 @@ autonomous research and report generation using LLMs and web search.
 import asyncio
 import json
 import os
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any, Literal, Optional
 
 from .actions import (
     add_references,
@@ -41,6 +42,23 @@ from .skills.writer import ReportGenerator
 from .utils.enum import ReportSource, ReportType, Tone
 from .utils.llm import create_chat_completion
 from .vector_store import VectorStoreWrapper
+
+
+@dataclass(frozen=True)
+class _PaperScreeningAuditAppendixPlan:
+    snapshot: PaperScreeningAuditSnapshot
+    language: Literal["zh", "en"]
+
+
+def _strict_audit_report_enabled(value: Any) -> bool:
+    if not isinstance(value, str):
+        raise ValueError("PAPER_SCREENING_AUDIT_REPORT_ENABLED must be true or false")
+    normalized = value.strip().casefold()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ValueError("PAPER_SCREENING_AUDIT_REPORT_ENABLED must be true or false")
 
 
 class GPTResearcher:
@@ -185,6 +203,8 @@ class GPTResearcher:
         self._paper_candidate_run_active = False
         self._paper_screening_audit_collector: PaperScreeningAuditCollector | None = None
         self._paper_screening_audit_run_ordinal = 0
+        self._paper_screening_report_write_active = False
+        self._paper_screening_audit_report_ready = False
         if _paper_candidate_collector is not None:
             if _paper_candidate_collector_owner:
                 raise ValueError("injected paper candidate collectors must be borrowed")
@@ -327,6 +347,38 @@ class GPTResearcher:
         if collector is None:
             raise RuntimeError(AUDIT_UNAVAILABLE_MESSAGE)
         return collector.snapshot()
+
+    def _build_paper_screening_audit_appendix_plan(
+        self,
+    ) -> _PaperScreeningAuditAppendixPlan | None:
+        """Capture the immutable report appendix inputs before report generation."""
+        if self.report_source != ReportSource.Web.value:
+            return None
+        if self.report_type != ReportType.ResearchReport.value:
+            return None
+        if getattr(self, "_paper_candidate_collector_borrower", False):
+            return None
+        if getattr(self, "_paper_screening_audit_report_ready", False) is not True:
+            return None
+        collector = getattr(self, "_paper_screening_audit_collector", None)
+        if collector is None or collector.state is not AuditCollectorState.FINALIZED:
+            return None
+        enabled = _strict_audit_report_enabled(
+            self.cfg.paper_screening_audit_report_enabled
+        )
+        if not enabled:
+            return None
+        snapshot = self.get_paper_screening_audit()
+        if snapshot is not collector.snapshot():
+            raise RuntimeError("paper screening audit snapshot identity changed")
+        language = self.cfg.language
+        if not isinstance(language, str):
+            raise ValueError("LANGUAGE must be a string")
+        normalized = language.strip().casefold()
+        mode: Literal["zh", "en"] = (
+            "zh" if normalized in {"chinese", "zh", "zh-cn", "zh-hans"} else "en"
+        )
+        return _PaperScreeningAuditAppendixPlan(snapshot=snapshot, language=mode)
     
     def _generate_research_id(self) -> str:
         """Generate a unique research ID for this session.
@@ -464,7 +516,10 @@ class GPTResearcher:
             False,
         )
         if owns_run:
+            if getattr(self, "_paper_screening_report_write_active", False):
+                raise RuntimeError("cannot start research while report writing is active")
             self._begin_paper_candidate_run()
+            self._paper_screening_audit_report_ready = False
             self._clear_paper_screening_audit_for_conduct_run()
 
         try:
@@ -494,6 +549,7 @@ class GPTResearcher:
                 self._paper_candidate_collector.finalize()
                 if audit_collector is not None:
                     audit_collector.commit()
+                    self._paper_screening_audit_report_ready = True
             return result
         except asyncio.CancelledError:
             if owns_run:
@@ -645,30 +701,55 @@ class GPTResearcher:
         Returns:
             The generated report as a string.
         """
-        # Use pre-generated images if available (generated during conduct_research)
-        has_available_images = bool(self.available_images)
-        
-        self._current_step = "report_writing"
-        await self._log_event("research", step="writing_report", details={
-            "existing_headers": existing_headers,
-            "context_source": "external" if ext_context else "internal",
-            "available_images_count": len(self.available_images),
-        })
+        if getattr(self, "_paper_candidate_run_active", False):
+            raise RuntimeError("cannot write report while a research run is active")
+        if getattr(self, "_paper_screening_report_write_active", False):
+            raise RuntimeError("report writing is already active")
+        self._paper_screening_report_write_active = True
+        try:
+            appendix_plan = self._build_paper_screening_audit_appendix_plan()
+            # Use pre-generated images if available (generated during conduct_research)
+            has_available_images = bool(self.available_images)
 
-        # Generate report with available images embedded
-        report = await self.report_generator.write_report(
-            existing_headers=existing_headers,
-            relevant_written_contents=relevant_written_contents,
-            ext_context=ext_context or self.context,
-            custom_prompt=custom_prompt,
-            available_images=self.available_images,  # Pass pre-generated images
-        )
+            self._current_step = "report_writing"
+            await self._log_event("research", step="writing_report", details={
+                "existing_headers": existing_headers,
+                "context_source": "external" if ext_context else "internal",
+                "available_images_count": len(self.available_images),
+            })
 
-        await self._log_event("research", step="report_completed", details={
-            "report_length": len(report),
-            "images_embedded": len(self.available_images) if has_available_images else 0,
-        })
-        return report
+            # Generate report with available images embedded
+            original_report = await self.report_generator.write_report(
+                existing_headers=existing_headers,
+                relevant_written_contents=relevant_written_contents,
+                ext_context=ext_context or self.context,
+                custom_prompt=custom_prompt,
+                available_images=self.available_images,  # Pass pre-generated images
+            )
+            report = original_report
+            if appendix_plan is not None:
+                from .screening.audit_markdown import (
+                    format_paper_screening_audit_markdown,
+                )
+
+                appendix = format_paper_screening_audit_markdown(
+                    appendix_plan.snapshot,
+                    appendix_plan.language,
+                )
+                report = original_report + "\n\n---\n\n" + appendix
+                if self.websocket is not None:
+                    await self.websocket.send_json({
+                        "type": "report",
+                        "output": appendix,
+                    })
+
+            await self._log_event("research", step="report_completed", details={
+                "report_length": len(report),
+                "images_embedded": len(self.available_images) if has_available_images else 0,
+            })
+            return report
+        finally:
+            self._paper_screening_report_write_active = False
 
     async def write_report_conclusion(self, report_body: str) -> str:
         """Write the conclusion section of the report.
@@ -709,7 +790,10 @@ class GPTResearcher:
             False,
         )
         if owns_run:
+            if getattr(self, "_paper_screening_report_write_active", False):
+                raise RuntimeError("cannot start research while report writing is active")
             self._begin_paper_candidate_run()
+            self._paper_screening_audit_report_ready = False
 
         try:
             result = await self._quick_search_impl(
