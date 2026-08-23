@@ -115,6 +115,9 @@ END
 BaseCheckpointSaver
 InMemorySaver
 RunnableConfig
+StateGraph.add_node
+StateGraph.add_edge
+StateGraph.add_conditional_edges
 StateGraph.compile(checkpointer=...)
 ainvoke
 aget_state
