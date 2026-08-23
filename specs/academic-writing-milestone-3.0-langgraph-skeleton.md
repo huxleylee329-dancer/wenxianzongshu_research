@@ -2,8 +2,10 @@
 
 Status: **Approved and frozen**
 
-This document is a review draft. It does not authorize implementation. Every
-approval and implementation acceptance item remains unchecked.
+This specification is approved and frozen and authorizes implementation only
+within the boundaries defined below. The explicit approval record in Section 16
+is checked; implementation acceptance items remain unchecked until the
+implementation is completed and verified.
 
 ## 1. Goal and executable boundary
 
