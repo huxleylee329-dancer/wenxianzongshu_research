@@ -9,8 +9,7 @@ exclude_packages = [
     "fastapi.*",
     "uvicorn",
     "jinja2",
-    "gpt-researcher",
-    "langgraph"
+    "gpt-researcher"
 ]
 
 with open(r"README.md", "r", encoding="utf-8") as f:

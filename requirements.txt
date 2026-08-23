@@ -15,7 +15,8 @@ langchain-core>=1.0.0
 langchain-ollama>=1.0.0
 langchain-openai>=1.0.0
 langchain-text-splitters>=1.0.0
-langgraph>=0.2.76
+langgraph>=1.2.11,<2
+langgraph-checkpoint>=4.2.0,<5
 
 # LLM Providers
 openai>=1.3.3

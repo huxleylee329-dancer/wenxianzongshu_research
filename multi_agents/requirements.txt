@@ -1,5 +1,5 @@
 json5
-langgraph
+langgraph>=1.2.11,<2
 json5
 langgraph-cli
 loguru
