@@ -2,7 +2,7 @@
 
 Status: **Approved and frozen**
 
-This specification has completed review and is approved and frozen.
+This revised specification has been re-reviewed, approved, and frozen.
 Implementation is authorized strictly within the two-file boundary frozen in
 Section 4. Any expansion must stop and receive approval through a revised
 specification. Implementation-acceptance items remain unchecked until the
@@ -482,7 +482,7 @@ The unique response pipeline is normative and may not be reordered:
 11. if any normalized member is empty or exceeds 512 code points, fail the
     entire response;
 12. before deduplication or root filtering, require the sum of normalized
-    question lengths to be at most 1,536 code points;
+    question lengths to be at most 1,024 code points;
 13. apply exact first-wins deduplication and then remove questions exactly equal
     to the root comparison key; if the result is empty, fail;
 14. construct `WorkflowTopicPlan` in an isolation helper; after that helper has
@@ -506,7 +506,7 @@ The normative private constants and values are:
 QUESTION_MIN_COUNT = 1
 QUESTION_MAX_COUNT = 3
 QUESTION_MAX_CHARS = 512
-QUESTION_TOTAL_MAX_CHARS = 1536
+QUESTION_TOTAL_MAX_CHARS = 1024
 RAW_RESPONSE_MAX_CHARS = 8192
 ```
 
@@ -526,7 +526,7 @@ The mechanical rules are:
 2. if any normalized member is empty, the whole response fails;
 3. each normalized question contains 1 through 512 Python code points;
 4. aggregate length is the sum of all normalized questions before
-   deduplication and root filtering and is at most 1,536 code points;
+   deduplication and root filtering and is at most 1,024 code points;
 5. no Unicode normalization is performed;
 6. internal whitespace and internal line breaks are not collapsed;
 7. normalized questions are deduplicated by exact code-point equality with
@@ -542,6 +542,41 @@ The mechanical rules are:
 11. if deduplication and root filtering leave no question, the response fails;
 12. questions are never truncated;
 13. neither the root query nor a fixed question is used as fallback.
+
+The aggregate cap is an independent, reachable cost constraint. It is computed
+from normalized Python-string code-point lengths after every member passes the
+raw-count, exact-string, nonempty, and 512-character checks, but before any
+deduplication or root filtering. The adapter never truncates or deletes a
+question to satisfy the cap. A total above 1,024 returns only:
+
+```python
+AdapterFailure(code="topic_planning_failed")
+```
+
+Tests use these exact fixed vectors directly, without search, probing, or a
+production helper:
+
+```python
+questions_1024 = (
+    "A" * 512,
+    "B" * 512,
+)
+questions_1025 = (
+    "A" * 512,
+    "B" * 512,
+    "C",
+)
+```
+
+For `questions_1024`, raw count is two, both members have length 512, the
+members are distinct and differ from the root comparison key, and aggregate
+length is exactly 1,024; processing continues through deduplication, root
+filtering, and `WorkflowTopicPlan` construction. For `questions_1025`, raw count
+is three and member lengths are 512, 512, and 1, so all earlier checks pass; the
+aggregate is exactly 1,025 and fails only at response-pipeline step 12.
+Deduplication, root filtering, and DTO construction receive zero calls on that
+path. The failure is not attributable to a fourth item or a 513-character
+member.
 
 The final projection is exactly:
 
@@ -734,7 +769,7 @@ for:
 - invalid JSON, code fences, comments, multiple JSON values, or trailing prose;
 - Pydantic response validation failure;
 - extra or wrong fields, wrong containers, or wrong member types;
-- question count, length, or aggregate violations;
+- question count, per-question length, or aggregate-over-1,024 violations;
 - an empty normalized question;
 - an empty result after deduplication and root filtering.
 
@@ -1052,8 +1087,9 @@ the test grants no artificial permission for it.
     response boundaries, with raw length checked before strip/parse;
 25. one, three, and four raw questions, with raw count checked before member
     normalization;
-26. 512/513 single-question and 1,536/1,537 aggregate boundaries, with aggregate
-    checked before deduplication/root filtering;
+26. 512/513 single-question boundaries and the exact 1,024-success/
+    1,025-failure aggregate vectors, with aggregate checked before
+    deduplication/root filtering and no later-step calls after failure;
 27. CRLF, CR, Unicode whitespace, emoji/non-BMP code-point counting, and
     preserved internal whitespace;
 28. any empty normalized question failing the whole response;
@@ -1180,7 +1216,8 @@ Milestone 3.2 does not implement:
 - [ ] The private strict response model and `model_validate_json()`-only boundary are approved.
 - [ ] The exact 14-step response pipeline and failure short-circuit order are approved.
 - [ ] The question/response constants and planner-only 1,024-token cap are approved.
-- [ ] CRLF, strip, length, aggregate, deduplication, order, and root-filter rules are approved.
+- [ ] CRLF, strip, per-question length, the reachable 1,024 aggregate cap, deduplication, order, and root-filter rules are approved.
+- [ ] The fixed 1,024-success and 1,025-aggregate-only-failure vectors and zero-later-step semantics are approved.
 - [ ] Empty/invalid model output returning only `topic_planning_failed` is approved.
 - [ ] Full existing `Config()` environment, optional file, initialization, and side-effect boundary is explicitly accepted.
 - [ ] The production client's exact constructor, Config projection, kwargs copy, and no-Config-retention rule are approved.
@@ -1229,7 +1266,8 @@ Milestone 3.2 does not implement:
 - [ ] The response is an exact string and is validated only by the strict private model's `model_validate_json()`.
 - [ ] All 14 response steps execute in order and every failure prevents every later step.
 - [ ] No repair, alternate parser, extraction, coercion, truncation, adapter/old-wrapper-loop retry, fallback, or second completion exists.
-- [ ] Raw response, question count, per-question, and aggregate limits match Section 10.
+- [ ] Raw response, question count, per-question, and reachable 1,024 aggregate limits match Section 10.
+- [ ] The exact 1,024/1,025 vectors prove aggregate success/failure independently of count and per-question checks.
 - [ ] Normalization, empty rejection, Unicode preservation, first-wins deduplication, and root filtering are exact.
 - [ ] `research_topic` is exactly `request.query` and IDs/attempt are the frozen values.
 - [ ] The final `WorkflowTopicPlan` passes canonical JSON round-trip validation.
