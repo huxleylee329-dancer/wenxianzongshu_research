@@ -25,6 +25,7 @@ from gpt_researcher.workflows.academic_writing.state import (
     WorkflowOutline,
     WorkflowOutlineSection,
     WorkflowResearchEvidence,
+    WorkflowSectionDraft,
     WorkflowTopicPlan,
     canonical_workflow_bytes,
     restore_workflow_state,
@@ -624,3 +625,92 @@ def test_recursive_json_validator_accepts_only_exact_json_types() -> None:
         "list": [None, False, 2, "nested", {"key": []}],
     }
     validate_json_value(value)
+
+
+def test_section_draft_is_strict_frozen_canonical_and_does_not_extend_state() -> None:
+    draft = WorkflowSectionDraft(
+        outline_id="outline:000001",
+        section_id="  existing/custom-section  ",
+        attempt=1,
+        content="  章节正文  ",
+    )
+    expected = {
+        "outline_id": "outline:000001",
+        "section_id": "  existing/custom-section  ",
+        "attempt": 1,
+        "content": "章节正文",
+    }
+    assert draft.model_dump(mode="json") == expected
+    encoded = json.dumps(
+        expected,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    restored = WorkflowSectionDraft.model_validate_json(encoded)
+    assert restored == draft
+    assert json.dumps(
+        restored.model_dump(mode="json"),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8") == encoded
+    with pytest.raises(ValidationError):
+        draft.content = "changed"  # type: ignore[misc]
+    assert "section_draft" not in AcademicWorkflowState.model_fields
+    assert "section_draft" not in _state().model_dump(mode="json")
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"outline_id": "outline:other"},
+        {"section_id": "   "},
+        {"attempt": True},
+        {"attempt": False},
+        {"attempt": 2},
+        {"attempt": 1.0},
+        {"attempt": "1"},
+        {"content": "\t\r\n"},
+        {"content": "x" * 24577},
+        {"extra": "forbidden"},
+    ],
+)
+def test_section_draft_rejects_invalid_python_shapes(changes: dict[str, object]) -> None:
+    data: dict[str, object] = {
+        "outline_id": "outline:000001",
+        "section_id": "section:any-existing-id",
+        "attempt": 1,
+        "content": "x" * 24576,
+    }
+    data.update(changes)
+    with pytest.raises((TypeError, ValidationError)):
+        WorkflowSectionDraft.model_validate(data)
+
+
+def test_section_draft_rejects_mapping_and_string_subclasses_and_json_attempts() -> None:
+    class MappingSubclass(dict[str, object]):
+        pass
+
+    class StringSubclass(str):
+        pass
+
+    valid: dict[str, object] = {
+        "outline_id": "outline:000001",
+        "section_id": "section:any-existing-id",
+        "attempt": 1,
+        "content": "body",
+    }
+    with pytest.raises((TypeError, ValidationError)):
+        WorkflowSectionDraft.model_validate(MappingSubclass(valid))
+    for field in ("outline_id", "section_id", "content"):
+        changed = dict(valid)
+        changed[field] = StringSubclass(str(changed[field]))
+        with pytest.raises((TypeError, ValidationError)):
+            WorkflowSectionDraft.model_validate(changed)
+    for attempt in (True, False, 0, 2, 1.0, "1", None):
+        changed = dict(valid, attempt=attempt)
+        with pytest.raises((TypeError, ValidationError)):
+            WorkflowSectionDraft.model_validate_json(json.dumps(changed))

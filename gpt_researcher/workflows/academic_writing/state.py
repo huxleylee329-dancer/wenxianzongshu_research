@@ -289,6 +289,44 @@ class WorkflowOutline(_StrictWorkflowModel):
         return values
 
 
+class WorkflowSectionDraft(_StrictWorkflowModel):
+    outline_id: Literal["outline:000001"]
+    section_id: str
+    attempt: FixedOne
+    content: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def _require_exact_python_input(cls, value: object) -> object:
+        if type(value) is cls:
+            return value
+        if type(value) is not dict:
+            raise TypeError("section draft must be an exact mapping")
+        for field_name in ("outline_id", "section_id", "content"):
+            if field_name in value and type(value[field_name]) is not str:
+                raise TypeError("section draft strings must be exact")
+        if "attempt" in value and type(value["attempt"]) is not int:
+            raise TypeError("section draft attempt must be exact")
+        return value
+
+    @field_validator("section_id")
+    @classmethod
+    def _validate_section_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("section draft section id must not be blank")
+        return value
+
+    @field_validator("content")
+    @classmethod
+    def _normalize_content(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("section draft content must not be blank")
+        if len(normalized) > 24576:
+            raise ValueError("section draft content is too long")
+        return normalized
+
+
 def _validate_outline_digest(value: str) -> str:
     if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
         raise ValueError("outline digest must be lowercase SHA-256 hexadecimal")
