@@ -2921,7 +2921,6 @@ _SUCCESS_EVENT_GOLDEN = (
     ("node_completed", "research_evidence"),
     ("node_started", "outline_writer"),
     ("node_completed", "outline_writer"),
-    ("workflow_completed", None),
 )
 
 

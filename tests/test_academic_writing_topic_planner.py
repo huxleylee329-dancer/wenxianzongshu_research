@@ -126,7 +126,6 @@ _SUCCESS_EVENTS = (
     ("node_completed", "research_evidence"),
     ("node_started", "outline_writer"),
     ("node_completed", "outline_writer"),
-    ("workflow_completed", None),
 )
 
 
@@ -2225,7 +2224,7 @@ async def test_graph_success_failure_crash_resume_and_downstream_resume() -> Non
         _request(), success_adapter, checkpointer=saver
     )
     assert _event_pairs(success) == _SUCCESS_EVENTS
-    assert success.phase == "outline_ready" and success.status == "completed"
+    assert success.phase == "outline_ready" and success.status == "running"
     assert success_factory.calls == 1
     assert delegate.evidence_calls == delegate.outline_calls == 1
 

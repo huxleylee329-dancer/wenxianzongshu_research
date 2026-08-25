@@ -401,7 +401,6 @@ SUCCESS_EVENTS = [
     ("node_completed", "research_evidence"),
     ("node_started", "outline_writer"),
     ("node_completed", "outline_writer"),
-    ("workflow_completed", None),
 ]
 
 
@@ -417,11 +416,11 @@ async def test_success_is_deterministic_and_threads_are_independent() -> None:
         checkpointer=saver,
     )
 
-    assert (first.phase, first.status) == ("outline_ready", "completed")
+    assert (first.phase, first.status) == ("outline_ready", "running")
     assert _event_projection(first) == SUCCESS_EVENTS
-    assert [event.order for event in first.events] == list(range(1, 8))
+    assert [event.order for event in first.events] == list(range(1, 7))
     assert [event.event_id for event in first.events] == [
-        f"event:{order:06d}" for order in range(1, 8)
+        f"event:{order:06d}" for order in range(1, 7)
     ]
     assert second.workflow_id == "workflow-2"
     assert second.events == first.events
@@ -684,7 +683,10 @@ async def test_start_and_resume_thread_guards_use_fixed_priority() -> None:
             FakeAdapter(),
             checkpointer=saver,
         )
-    with pytest.raises(ThreadProtocolError, match="^academic workflow thread is not resumable$"):
+    with pytest.raises(
+        ThreadProtocolError,
+        match="^academic outline approval decision is required$",
+    ):
         await resume_academic_workflow(
             _identity(), FakeAdapter(), checkpointer=saver
         )
@@ -783,8 +785,10 @@ def _assert_no_environment_access(path: Path) -> None:
             raise AssertionError(f"environment-capable os import in {path}")
 
 
+@pytest.mark.parametrize("fail_after_exec", [False, True])
 def test_new_module_imports_have_no_differential_side_effects(
     monkeypatch: pytest.MonkeyPatch,
+    fail_after_exec: bool,
 ) -> None:
     from langgraph.graph import StateGraph
 
@@ -867,18 +871,28 @@ def test_new_module_imports_have_no_differential_side_effects(
         for parent_name, attribute in parent_bindings
     }
 
+    class _LoaderAfterExecFailure(RuntimeError):
+        pass
+
     reloaded: dict[str, object] = {}
     try:
-        for name in reversed(module_names):
-            assert sys.modules.pop(name) is original_modules[name]
-        for name in module_names:
-            reloaded[name] = importlib.import_module(name)
-            assert reloaded[name] is sys.modules[name]
-            assert reloaded[name] is not original_modules[name]
-            assert reloaded[name].__name__ == name  # type: ignore[attr-defined]
-        assert observed == []
-        assert logger_snapshot() == loggers_before
-        assert dict(os.environ) == environment_before
+        try:
+            for name in reversed(module_names):
+                assert sys.modules.pop(name) is original_modules[name]
+            for name in module_names:
+                reloaded[name] = importlib.import_module(name)
+                assert reloaded[name] is sys.modules[name]
+                assert reloaded[name] is not original_modules[name]
+                assert reloaded[name].__name__ == name  # type: ignore[attr-defined]
+            assert observed == []
+            assert logger_snapshot() == loggers_before
+            assert dict(os.environ) == environment_before
+            if fail_after_exec:
+                raise _LoaderAfterExecFailure(
+                    "fixed synthetic loader-after-exec failure"
+                )
+        except _LoaderAfterExecFailure:
+            assert fail_after_exec
     finally:
         for name in reversed(module_names):
             sys.modules.pop(name, None)

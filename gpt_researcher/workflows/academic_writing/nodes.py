@@ -8,11 +8,13 @@ from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
 from langchain_core.runnables import RunnableConfig
+from langgraph.types import interrupt
 from pydantic import BaseModel
 
 from .adapters import AcademicWritingAdapter
 from .state import (
     AcademicWorkflowGraphState,
+    AcademicOutlineDecisionCommand,
     AcademicWorkflowState,
     AdapterFailure,
     ExecutionError,
@@ -21,8 +23,11 @@ from .state import (
     WorkflowError,
     WorkflowEvent,
     WorkflowOutline,
+    WorkflowOutlineDecisionRecord,
     WorkflowResearchEvidence,
     WorkflowTopicPlan,
+    _outline_digest,
+    _outline_digest_equal,
     restore_workflow_state,
     validate_json_value,
     workflow_to_graph_state,
@@ -37,6 +42,18 @@ _Node = Callable[
 _TransitionBuilder = Callable[[object], AcademicWorkflowState]
 _EXECUTION_FAILURE = object()
 _INVARIANT_FAILURE = object()
+_APPROVE_COMMIT_FAILURE = object()
+_REJECT_COMMIT_FAILURE = object()
+
+
+class _OutlineApproveCommitError(RuntimeError):
+    def __init__(self) -> None:
+        super().__init__("academic outline decision commit failed")
+
+
+class _OutlineRejectCommitError(RuntimeError):
+    def __init__(self) -> None:
+        super().__init__("academic outline decision commit failed")
 
 
 def _validated_dto(value: object, expected_type: type[_Dto]) -> _Dto:
@@ -182,6 +199,7 @@ def _failure_state(
         topic_plan=state.topic_plan,
         research_evidence=state.research_evidence,
         outline=state.outline,
+        outline_decision=None,
         errors=(error,),
         events=state.events + (started, failed),
     )
@@ -214,6 +232,7 @@ def _make_topic_planner_node(adapter: AcademicWritingAdapter) -> _Node:
                 topic_plan=plan,
                 research_evidence=None,
                 outline=None,
+                outline_decision=None,
                 errors=(),
                 events=state.events + (started, completed),
             )
@@ -255,6 +274,7 @@ def _make_research_evidence_node(adapter: AcademicWritingAdapter) -> _Node:
                 topic_plan=state.topic_plan,
                 research_evidence=evidence,
                 outline=None,
+                outline_decision=None,
                 errors=(),
                 events=state.events + (started, completed),
             )
@@ -288,22 +308,20 @@ def _make_outline_writer_node(adapter: AcademicWritingAdapter) -> _Node:
             completed = _event(
                 state.events + (started,), "node_completed", "outline_writer"
             )
-            workflow_completed = _event(
-                state.events + (started, completed), "workflow_completed", None
-            )
             return AcademicWorkflowState(
                 schema_version="1",
                 workflow_id=state.workflow_id,
                 thread_id=state.thread_id,
                 run_id=state.run_id,
                 phase="outline_ready",
-                status="completed",
+                status="running",
                 request=state.request,
                 topic_plan=state.topic_plan,
                 research_evidence=state.research_evidence,
                 outline=outline,
+                outline_decision=None,
                 errors=(),
-                events=state.events + (started, completed, workflow_completed),
+                events=state.events + (started, completed),
             )
 
         outcome = await _prepare_transition(
@@ -317,11 +335,182 @@ def _make_outline_writer_node(adapter: AcademicWritingAdapter) -> _Node:
     return _outline_writer
 
 
-def _make_nodes(adapter: AcademicWritingAdapter) -> tuple[_Node, _Node, _Node]:
+def _approval_interrupt_payload(state: AcademicWorkflowState) -> dict[str, object]:
+    if state.outline is None:
+        raise InvariantError()
+    payload: dict[str, object] = {
+        "allowed_decisions": ["approve", "reject"],
+        "outline_digest": _outline_digest(state.outline),
+        "outline_id": state.outline.outline_id,
+        "run_id": state.run_id,
+        "schema_version": "1",
+        "thread_id": state.thread_id,
+        "workflow_id": state.workflow_id,
+    }
+    validate_json_value(payload)
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if len(canonical) > 2048:
+        raise InvariantError()
+    return payload
+
+
+def _restore_approval_command(
+    raw_resume: object, state: AcademicWorkflowState
+) -> AcademicOutlineDecisionCommand:
+    if type(raw_resume) is not dict:
+        raise TypeError("approval resume must be an exact mapping")
+    validate_json_value(raw_resume)
+    canonical = json.dumps(
+        raw_resume,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if len(canonical) > 2048:
+        raise ValueError("approval resume is too long")
+    command = AcademicOutlineDecisionCommand.model_validate_json(canonical)
+    if command.model_dump(mode="json") != raw_resume:
+        raise ValueError("approval resume changed during validation")
+    if state.outline is None:
+        raise ValueError("approval predecessor has no outline")
+    if (
+        command.workflow_id,
+        command.thread_id,
+        command.run_id,
+        command.outline_id,
+    ) != (
+        state.workflow_id,
+        state.thread_id,
+        state.run_id,
+        state.outline.outline_id,
+    ):
+        raise ValueError("approval identity differs")
+    if not _outline_digest_equal(
+        command.outline_digest, _outline_digest(state.outline)
+    ):
+        raise ValueError("approval outline digest differs")
+    return command
+
+
+def _build_approval_terminal_state(
+    state: AcademicWorkflowState,
+    command: AcademicOutlineDecisionCommand,
+) -> AcademicWorkflowState:
+    if state.outline is None:
+        raise ValueError("approval predecessor has no outline")
+    record = WorkflowOutlineDecisionRecord(
+        decision_id="outline-decision:000001",
+        schema_version="1",
+        workflow_id=command.workflow_id,
+        thread_id=command.thread_id,
+        run_id=command.run_id,
+        outline_id=command.outline_id,
+        outline_digest=command.outline_digest,
+        decision=command.decision,
+        actor_assertion=command.actor_assertion,
+        attempt=1,
+    )
+    started = _event(state.events, "node_started", "outline_approval")
+    completed = _event(
+        state.events + (started,), "node_completed", "outline_approval"
+    )
+    terminal_type = (
+        "workflow_completed" if command.decision == "approve" else "workflow_rejected"
+    )
+    terminal = _event(state.events + (started, completed), terminal_type, None)
+    return AcademicWorkflowState(
+        schema_version="1",
+        workflow_id=state.workflow_id,
+        thread_id=state.thread_id,
+        run_id=state.run_id,
+        phase=(
+            "outline_approved"
+            if command.decision == "approve"
+            else "outline_rejected"
+        ),
+        status="completed",
+        request=state.request,
+        topic_plan=state.topic_plan,
+        research_evidence=state.research_evidence,
+        outline=state.outline,
+        outline_decision=record,
+        errors=(),
+        events=state.events + (started, completed, terminal),
+    )
+
+
+def _prepare_approval_transition(
+    state: AcademicWorkflowState, raw_resume: object
+) -> object:
+    command: AcademicOutlineDecisionCommand | None = None
+    try:
+        command = _restore_approval_command(raw_resume, state)
+    except Exception:
+        return _INVARIANT_FAILURE
+
+    try:
+        return _validated_transition(
+            lambda: _build_approval_terminal_state(state, command)
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return (
+            _APPROVE_COMMIT_FAILURE
+            if command.decision == "approve"
+            else _REJECT_COMMIT_FAILURE
+        )
+
+
+def _run_approval_interrupt(state: AcademicWorkflowState) -> object:
+    raw_resume = interrupt(_approval_interrupt_payload(state))
+    return _prepare_approval_transition(state, raw_resume)
+
+
+def _raise_approval_outcome_failure(failure: object) -> None:
+    if failure is _APPROVE_COMMIT_FAILURE:
+        raise _OutlineApproveCommitError() from None
+    if failure is _REJECT_COMMIT_FAILURE:
+        raise _OutlineRejectCommitError() from None
+    raise InvariantError() from None
+
+
+def _make_outline_approval_node() -> _Node:
+    async def _outline_approval(
+        graph_state: AcademicWorkflowGraphState,
+        config: RunnableConfig,
+    ) -> AcademicWorkflowGraphState:
+        state = _restored_predecessor(
+            graph_state, config, phase="outline_ready"
+        )
+        outcome = _run_approval_interrupt(state)
+        if (
+            outcome is _APPROVE_COMMIT_FAILURE
+            or outcome is _REJECT_COMMIT_FAILURE
+            or outcome is _INVARIANT_FAILURE
+            or type(outcome) is not dict
+        ):
+            failure = outcome
+            del graph_state, config, state, outcome
+            _raise_approval_outcome_failure(failure)
+        return outcome
+
+    return _outline_approval
+
+
+def _make_nodes(adapter: AcademicWritingAdapter) -> tuple[_Node, _Node, _Node, _Node]:
     return (
         _make_topic_planner_node(adapter),
         _make_research_evidence_node(adapter),
         _make_outline_writer_node(adapter),
+        _make_outline_approval_node(),
     )
 
 

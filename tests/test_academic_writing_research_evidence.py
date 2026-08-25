@@ -444,7 +444,6 @@ _SUCCESS_EVENTS = (
     ("node_completed", "research_evidence"),
     ("node_started", "outline_writer"),
     ("node_completed", "outline_writer"),
-    ("workflow_completed", None),
 )
 
 
@@ -2074,7 +2073,7 @@ async def test_contract_violation_is_sanitized_by_graph_and_checkpoint() -> None
         adapter,
         checkpointer=saver,
     )
-    assert state.status == "completed"
+    assert state.status == "running"
     assert _event_pairs(state) == _SUCCESS_EVENTS
     assert delegate.plan_calls == 1
     assert delegate.outline_calls == 1
@@ -2274,9 +2273,9 @@ async def test_full_graph_success_has_exact_events_and_single_execution() -> Non
         _request(thread_id="thread-success"), adapter, checkpointer=saver
     )
     assert state.phase == "outline_ready"
-    assert state.status == "completed"
+    assert state.status == "running"
     assert _event_pairs(state) == _SUCCESS_EVENTS
-    assert tuple(event.order for event in state.events) == tuple(range(1, 8))
+    assert tuple(event.order for event in state.events) == tuple(range(1, 7))
     assert not any(event.event_type == "workflow_failed" for event in state.events)
     assert delegate.plan_calls == 1
     assert delegate.outline_calls == 1
@@ -2295,7 +2294,7 @@ async def test_full_graph_success_has_exact_events_and_single_execution() -> Non
     snapshot = await graph_module._build_graph(adapter, saver).aget_state(
         {"configurable": {"thread_id": "thread-success"}}
     )
-    assert snapshot.next == ()
+    assert snapshot.next == ("outline_approval",)
 
 
 @pytest.mark.asyncio
@@ -2333,7 +2332,7 @@ async def test_full_graph_raw_crash_resume_and_safe_checkpoint_metadata() -> Non
         adapter,
         checkpointer=saver,
     )
-    assert state.status == "completed"
+    assert state.status == "running"
     assert delegate.plan_calls == 1
     assert delegate.outline_calls == 1
     assert len(factory.calls) == 2
@@ -2417,7 +2416,7 @@ async def test_full_graph_every_raw_crash_is_pending_safe_and_resumable(
         adapter,
         checkpointer=saver,
     )
-    assert state.status == "completed"
+    assert state.status == "running"
     assert _event_pairs(state) == _SUCCESS_EVENTS
     assert delegate.plan_calls == 1
     assert delegate.outline_calls == 1
@@ -2515,7 +2514,7 @@ async def test_full_graph_expected_failure_and_outer_cancellation_resume() -> No
         adapter,
         checkpointer=saver,
     )
-    assert state.status == "completed"
+    assert state.status == "running"
     assert _event_pairs(state) == _SUCCESS_EVENTS
     assert delegate.plan_calls == 1
     assert len(factory.calls) == 2

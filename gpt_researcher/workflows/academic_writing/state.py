@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, TypeAlias, TypedDict
 
+import hashlib
+import hmac
 import json
+import unicodedata
 from pydantic import (
     BaseModel,
     BeforeValidator,
@@ -20,8 +23,9 @@ JsonValue: TypeAlias = (
     None | bool | int | str | list["JsonValue"] | dict[str, "JsonValue"]
 )
 NodeId: TypeAlias = Literal[
-    "topic_planner", "research_evidence", "outline_writer"
+    "topic_planner", "research_evidence", "outline_writer", "outline_approval"
 ]
+OutlineDecision: TypeAlias = Literal["approve", "reject"]
 FailureCode: TypeAlias = Literal[
     "topic_planning_failed",
     "research_evidence_failed",
@@ -56,6 +60,13 @@ def _strip_nonblank(value: str, label: str) -> str:
     return normalized
 
 
+def _bounded_identity(value: str, label: str) -> str:
+    normalized = _strip_nonblank(value, label)
+    if len(normalized) > 256:
+        raise ValueError(f"{label} is too long")
+    return normalized
+
+
 def _normalize_unique_strings(values: tuple[str, ...], label: str) -> tuple[str, ...]:
     normalized = tuple(_strip_nonblank(value, label) for value in values)
     if len(set(normalized)) != len(normalized):
@@ -71,7 +82,7 @@ class AcademicWorkflowIdentity(_StrictWorkflowModel):
     @field_validator("workflow_id", "thread_id", "run_id")
     @classmethod
     def _normalize_identity(cls, value: str) -> str:
-        return _strip_nonblank(value, "workflow identity")
+        return _bounded_identity(value, "workflow identity")
 
 
 class AcademicWorkflowRequest(_StrictWorkflowModel):
@@ -103,6 +114,11 @@ class AcademicWorkflowRequest(_StrictWorkflowModel):
     def _normalize_required_text(cls, value: str) -> str:
         return _strip_nonblank(value, "request value")
 
+    @field_validator("workflow_id", "thread_id", "run_id")
+    @classmethod
+    def _bound_identity(cls, value: str) -> str:
+        return _bounded_identity(value, "request identity")
+
     @field_validator("source_urls", "document_urls", "query_domains")
     @classmethod
     def _normalize_ordered_values(cls, values: tuple[str, ...]) -> tuple[str, ...]:
@@ -121,6 +137,11 @@ class WorkflowTopicPlan(_StrictWorkflowModel):
     @classmethod
     def _normalize_text(cls, value: str) -> str:
         return _strip_nonblank(value, "topic-plan value")
+
+    @field_validator("workflow_id", "run_id")
+    @classmethod
+    def _bound_identity(cls, value: str) -> str:
+        return _bounded_identity(value, "topic-plan identity")
 
     @field_validator("research_questions")
     @classmethod
@@ -268,6 +289,136 @@ class WorkflowOutline(_StrictWorkflowModel):
         return values
 
 
+def _validate_outline_digest(value: str) -> str:
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise ValueError("outline digest must be lowercase SHA-256 hexadecimal")
+    return value
+
+
+def _validate_actor_assertion(value: str) -> str:
+    normalized = _strip_nonblank(value, "actor assertion")
+    if len(normalized) > 256:
+        raise ValueError("actor assertion is too long")
+    if any(
+        character in "\r\n\x00" or unicodedata.category(character) == "Cc"
+        for character in normalized
+    ):
+        raise ValueError("actor assertion contains a control character")
+    return normalized
+
+
+class AcademicOutlineDecisionCommand(_StrictWorkflowModel):
+    schema_version: Literal["1"]
+    workflow_id: str
+    thread_id: str
+    run_id: str
+    outline_id: Literal["outline:000001"]
+    outline_digest: str
+    decision: OutlineDecision
+    actor_assertion: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def _require_exact_python_input(cls, value: object) -> object:
+        if type(value) is cls:
+            return value
+        if type(value) is not dict:
+            raise TypeError("outline decision command must be an exact mapping")
+        for field_name in (
+            "schema_version",
+            "workflow_id",
+            "thread_id",
+            "run_id",
+            "outline_id",
+            "outline_digest",
+            "decision",
+            "actor_assertion",
+        ):
+            if field_name in value and type(value[field_name]) is not str:
+                raise TypeError("outline decision command strings must be exact")
+        return value
+
+    @field_validator("workflow_id", "thread_id", "run_id")
+    @classmethod
+    def _normalize_identity(cls, value: str) -> str:
+        return _bounded_identity(value, "outline decision identity")
+
+    @field_validator("outline_digest")
+    @classmethod
+    def _normalize_digest(cls, value: str) -> str:
+        return _validate_outline_digest(value)
+
+    @field_validator("actor_assertion")
+    @classmethod
+    def _normalize_actor(cls, value: str) -> str:
+        return _validate_actor_assertion(value)
+
+    @model_validator(mode="after")
+    def _validate_canonical_length(self) -> "AcademicOutlineDecisionCommand":
+        payload = json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(payload) > 2048:
+            raise ValueError("outline decision command is too long")
+        return self
+
+
+class WorkflowOutlineDecisionRecord(_StrictWorkflowModel):
+    decision_id: Literal["outline-decision:000001"]
+    schema_version: Literal["1"]
+    workflow_id: str
+    thread_id: str
+    run_id: str
+    outline_id: Literal["outline:000001"]
+    outline_digest: str
+    decision: OutlineDecision
+    actor_assertion: str
+    attempt: FixedOne
+
+    @model_validator(mode="before")
+    @classmethod
+    def _require_exact_python_input(cls, value: object) -> object:
+        if type(value) is cls:
+            return value
+        if type(value) is not dict:
+            raise TypeError("outline decision record must be an exact mapping")
+        for field_name in (
+            "decision_id",
+            "schema_version",
+            "workflow_id",
+            "thread_id",
+            "run_id",
+            "outline_id",
+            "outline_digest",
+            "decision",
+            "actor_assertion",
+        ):
+            if field_name in value and type(value[field_name]) is not str:
+                raise TypeError("outline decision record strings must be exact")
+        if "attempt" in value and type(value["attempt"]) is not int:
+            raise TypeError("outline decision record attempt must be exact")
+        return value
+
+    @field_validator("workflow_id", "thread_id", "run_id")
+    @classmethod
+    def _normalize_identity(cls, value: str) -> str:
+        return _bounded_identity(value, "outline decision record identity")
+
+    @field_validator("outline_digest")
+    @classmethod
+    def _normalize_digest(cls, value: str) -> str:
+        return _validate_outline_digest(value)
+
+    @field_validator("actor_assertion")
+    @classmethod
+    def _normalize_actor(cls, value: str) -> str:
+        return _validate_actor_assertion(value)
+
+
 class AdapterFailure(_StrictWorkflowModel):
     code: FailureCode
 
@@ -297,7 +448,11 @@ class WorkflowEvent(_StrictWorkflowModel):
     event_id: str
     order: PositiveStrictInt
     event_type: Literal[
-        "node_started", "node_completed", "workflow_completed", "workflow_failed"
+        "node_started",
+        "node_completed",
+        "workflow_completed",
+        "workflow_rejected",
+        "workflow_failed",
     ]
     node_id: NodeId | None
     attempt: FixedOne
@@ -311,9 +466,9 @@ class WorkflowEvent(_StrictWorkflowModel):
     def _validate_event(self) -> "WorkflowEvent":
         if self.event_id != f"event:{self.order:06d}":
             raise ValueError("event id must match order")
-        if self.event_type == "workflow_completed":
+        if self.event_type in ("workflow_completed", "workflow_rejected"):
             if self.node_id is not None:
-                raise ValueError("workflow_completed must not name a node")
+                raise ValueError("terminal workflow events must not name a node")
         elif self.node_id is None:
             raise ValueError("node and failure events must name a node")
         return self
@@ -333,10 +488,19 @@ _EVIDENCE_SUCCESS = _TOPIC_SUCCESS + (
     ("node_started", "research_evidence"),
     ("node_completed", "research_evidence"),
 )
-_OUTLINE_SUCCESS = _EVIDENCE_SUCCESS + (
+_OUTLINE_PAUSE = _EVIDENCE_SUCCESS + (
     ("node_started", "outline_writer"),
     ("node_completed", "outline_writer"),
+)
+_OUTLINE_APPROVED = _OUTLINE_PAUSE + (
+    ("node_started", "outline_approval"),
+    ("node_completed", "outline_approval"),
     ("workflow_completed", None),
+)
+_OUTLINE_REJECTED = _OUTLINE_PAUSE + (
+    ("node_started", "outline_approval"),
+    ("node_completed", "outline_approval"),
+    ("workflow_rejected", None),
 )
 
 
@@ -346,20 +510,26 @@ class AcademicWorkflowState(_StrictWorkflowModel):
     thread_id: str
     run_id: str
     phase: Literal[
-        "initialized", "topic_planned", "evidence_collected", "outline_ready"
+        "initialized",
+        "topic_planned",
+        "evidence_collected",
+        "outline_ready",
+        "outline_approved",
+        "outline_rejected",
     ]
     status: Literal["running", "completed", "failed"]
     request: AcademicWorkflowRequest
     topic_plan: WorkflowTopicPlan | None
     research_evidence: WorkflowResearchEvidence | None
     outline: WorkflowOutline | None
+    outline_decision: WorkflowOutlineDecisionRecord | None
     errors: tuple[WorkflowError, ...]
     events: tuple[WorkflowEvent, ...]
 
     @field_validator("workflow_id", "thread_id", "run_id")
     @classmethod
     def _normalize_identity(cls, value: str) -> str:
-        return _strip_nonblank(value, "workflow state identity")
+        return _bounded_identity(value, "workflow state identity")
 
     @model_validator(mode="after")
     def _validate_reachable_shape(self) -> "AcademicWorkflowState":
@@ -393,6 +563,7 @@ class AcademicWorkflowState(_StrictWorkflowModel):
         shape = (self.phase, self.status)
         expected_artifacts: tuple[bool, bool, bool]
         expected_events: tuple[tuple[str, NodeId | None], ...]
+        expected_decision: OutlineDecision | None = None
         expected_failure_node: NodeId | None = None
         if shape == ("initialized", "running"):
             expected_artifacts = (False, False, False)
@@ -403,9 +574,17 @@ class AcademicWorkflowState(_StrictWorkflowModel):
         elif shape == ("evidence_collected", "running"):
             expected_artifacts = (True, True, False)
             expected_events = _EVIDENCE_SUCCESS
-        elif shape == ("outline_ready", "completed"):
+        elif shape == ("outline_ready", "running"):
             expected_artifacts = (True, True, True)
-            expected_events = _OUTLINE_SUCCESS
+            expected_events = _OUTLINE_PAUSE
+        elif shape == ("outline_approved", "completed"):
+            expected_artifacts = (True, True, True)
+            expected_events = _OUTLINE_APPROVED
+            expected_decision = "approve"
+        elif shape == ("outline_rejected", "completed"):
+            expected_artifacts = (True, True, True)
+            expected_events = _OUTLINE_REJECTED
+            expected_decision = "reject"
         elif shape == ("initialized", "failed"):
             expected_artifacts = (False, False, False)
             expected_failure_node = "topic_planner"
@@ -452,6 +631,30 @@ class AcademicWorkflowState(_StrictWorkflowModel):
             or self.errors[0].failed_node_id != expected_failure_node
         ):
             raise ValueError("failed workflow must contain its exact error")
+
+        if expected_decision is None:
+            if self.outline_decision is not None:
+                raise ValueError("nonterminal workflow cannot contain a decision")
+        else:
+            decision = self.outline_decision
+            if decision is None or self.outline is None:
+                raise ValueError("terminal outline state requires a decision")
+            if decision.decision != expected_decision:
+                raise ValueError("outline decision does not match phase")
+            if (
+                decision.workflow_id,
+                decision.thread_id,
+                decision.run_id,
+                decision.outline_id,
+            ) != (
+                self.workflow_id,
+                self.thread_id,
+                self.run_id,
+                self.outline.outline_id,
+            ):
+                raise ValueError("outline decision identity must match state")
+            if decision.outline_digest != _outline_digest(self.outline):
+                raise ValueError("outline decision digest must match outline")
         return self
 
 
@@ -474,6 +677,7 @@ _THREAD_MESSAGES = {
     "identity": "academic workflow identity does not match checkpoint",
     "exists": "academic workflow thread already exists",
     "not_resumable": "academic workflow thread is not resumable",
+    "approval_required": "academic outline approval decision is required",
 }
 
 
@@ -481,9 +685,79 @@ class ThreadProtocolError(RuntimeError):
     """A fixed safe thread-protocol failure."""
 
     def __init__(
-        self, kind: Literal["missing", "identity", "exists", "not_resumable"]
+        self,
+        kind: Literal[
+            "missing", "identity", "exists", "not_resumable", "approval_required"
+        ],
     ) -> None:
         super().__init__(_THREAD_MESSAGES[kind])
+
+
+_OUTLINE_DECISION_MESSAGES = {
+    "invalid": "academic outline decision command is invalid",
+    "missing": "academic workflow checkpoint does not exist",
+    "identity": "academic workflow identity does not match checkpoint",
+    "committed": "academic outline decision has already been committed",
+    "unavailable": "academic outline decision is not available",
+    "outline": "academic outline identity does not match checkpoint",
+    "digest": "academic outline revision does not match checkpoint",
+    "retry": "academic outline retry decision does not match failed attempt",
+}
+
+
+class OutlineDecisionProtocolError(RuntimeError):
+    """A fixed safe outline-decision facade failure."""
+
+    def __init__(
+        self,
+        kind: Literal[
+            "invalid",
+            "missing",
+            "identity",
+            "committed",
+            "unavailable",
+            "outline",
+            "digest",
+            "retry",
+        ],
+    ) -> None:
+        super().__init__(_OUTLINE_DECISION_MESSAGES[kind])
+
+
+def _canonical_outline_bytes(outline: WorkflowOutline) -> bytes:
+    if type(outline) is not WorkflowOutline:
+        raise TypeError("outline must be an exact WorkflowOutline")
+    payload = outline.model_dump(mode="json")
+    validate_json_value(payload)
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    restored = WorkflowOutline.model_validate_json(encoded)
+    if type(restored) is not WorkflowOutline or restored != outline:
+        raise ValueError("outline canonical round trip changed the model")
+    restored_payload = restored.model_dump(mode="json")
+    restored_encoded = json.dumps(
+        restored_payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if restored_payload != payload or restored_encoded != encoded:
+        raise ValueError("outline canonical round trip changed bytes")
+    return encoded
+
+
+def _outline_digest(outline: WorkflowOutline) -> str:
+    return hashlib.sha256(_canonical_outline_bytes(outline)).hexdigest()
+
+
+def _outline_digest_equal(left: str, right: str) -> bool:
+    return hmac.compare_digest(left, right)
 
 
 def validate_json_value(value: object) -> None:

@@ -18,6 +18,7 @@ from gpt_researcher.workflows.academic_writing.state import (
     AcademicWorkflowRequest,
     AcademicWorkflowState,
     AdapterFailure,
+    WorkflowOutlineDecisionRecord,
     WorkflowError,
     WorkflowEvent,
     WorkflowEvidenceSource,
@@ -134,10 +135,19 @@ EVIDENCE_EVENTS = TOPIC_EVENTS + (
     _event(3, "node_started", "research_evidence"),
     _event(4, "node_completed", "research_evidence"),
 )
-SUCCESS_EVENTS = EVIDENCE_EVENTS + (
+PAUSE_EVENTS = EVIDENCE_EVENTS + (
     _event(5, "node_started", "outline_writer"),
     _event(6, "node_completed", "outline_writer"),
-    _event(7, "workflow_completed", None),
+)
+APPROVE_EVENTS = PAUSE_EVENTS + (
+    _event(7, "node_started", "outline_approval"),
+    _event(8, "node_completed", "outline_approval"),
+    _event(9, "workflow_completed", None),
+)
+REJECT_EVENTS = PAUSE_EVENTS + (
+    _event(7, "node_started", "outline_approval"),
+    _event(8, "node_completed", "outline_approval"),
+    _event(9, "workflow_rejected", None),
 )
 
 
@@ -153,11 +163,32 @@ def _state(**changes: Any) -> AcademicWorkflowState:
         "topic_plan": None,
         "research_evidence": None,
         "outline": None,
+        "outline_decision": None,
         "errors": (),
         "events": (),
     }
     data.update(changes)
     return AcademicWorkflowState(**data)
+
+
+def _decision(
+    decision: str, outline: WorkflowOutline
+) -> WorkflowOutlineDecisionRecord:
+    return WorkflowOutlineDecisionRecord(
+        decision_id="outline-decision:000001",
+        schema_version="1",
+        workflow_id="workflow-1",
+        thread_id="thread-1",
+        run_id="run-1",
+        outline_id="outline:000001",
+        outline_digest=(
+            "f770a9a8afdcd0e06031956653848d588"
+            "8d9071451a80a68d85d97f1dd0bc1e1"
+        ),
+        decision=decision,
+        actor_assertion="actor-A",
+        attempt=1,
+    )
 
 
 def _assert_recursive_type_equality(left: Any, right: Any) -> None:
@@ -394,11 +425,28 @@ def test_all_reachable_phase_status_shapes_validate() -> None:
         ),
         _state(
             phase="outline_ready",
+            topic_plan=plan,
+            research_evidence=evidence,
+            outline=outline,
+            events=PAUSE_EVENTS,
+        ),
+        _state(
+            phase="outline_approved",
             status="completed",
             topic_plan=plan,
             research_evidence=evidence,
             outline=outline,
-            events=SUCCESS_EVENTS,
+            outline_decision=_decision("approve", outline),
+            events=APPROVE_EVENTS,
+        ),
+        _state(
+            phase="outline_rejected",
+            status="completed",
+            topic_plan=plan,
+            research_evidence=evidence,
+            outline=outline,
+            outline_decision=_decision("reject", outline),
+            events=REJECT_EVENTS,
         ),
         _state(
             status="failed",
@@ -461,6 +509,8 @@ def test_all_reachable_phase_status_shapes_validate() -> None:
         "topic_planned",
         "evidence_collected",
         "outline_ready",
+        "outline_approved",
+        "outline_rejected",
         "initialized",
         "topic_planned",
         "evidence_collected",
@@ -494,19 +544,18 @@ def test_unreachable_shapes_and_cross_references_are_rejected() -> None:
             topic_plan=_plan(),
             research_evidence=_evidence(),
             outline=_outline(evidence_id="evidence:wrong"),
-            events=SUCCESS_EVENTS,
+            events=PAUSE_EVENTS,
         )
 
 
 def test_application_json_round_trip_preserves_values_types_model_and_bytes() -> None:
     state = _state(
         phase="outline_ready",
-        status="completed",
         request=_request(query="确定性研究", language="zh"),
         topic_plan=_plan(),
         research_evidence=_evidence(),
         outline=_outline(),
-        events=SUCCESS_EVENTS,
+        events=PAUSE_EVENTS,
     )
     graph_state = workflow_to_graph_state(state)
     assert set(graph_state) == {"workflow"}
