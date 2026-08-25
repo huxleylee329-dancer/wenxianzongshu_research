@@ -413,7 +413,7 @@ workflow_id/thread_id/run_id  1..256 Python code points after existing strip
 outline_digest                exactly 64 lowercase ASCII hexadecimal chars
 actor_assertion               1..256 Python code points after strip
 canonical command JSON        at most 2048 Python code points
-resume mapping                exactly the seven command fields
+resume mapping                exactly the eight command fields
 ```
 
 The same 256-code-point identity cap is added to the existing `workflow_id`,
