@@ -14,6 +14,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictInt,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -196,12 +197,93 @@ class WorkflowEvidenceSource(_StrictWorkflowModel):
         return self
 
 
+class WorkflowEvidenceProvenance(_StrictWorkflowModel):
+    source_id: str
+    evidence_blocks: tuple[str, ...]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _require_exact_python_input(
+        cls, value: object, info: ValidationInfo
+    ) -> object:
+        if type(value) is cls:
+            return value
+        if type(value) is not dict:
+            raise TypeError("evidence provenance must be an exact mapping")
+        keys = tuple(value.keys())  # type: ignore[union-attr]
+        if any(type(key) is not str for key in keys) or set(keys) != {
+            "source_id",
+            "evidence_blocks",
+        }:
+            raise TypeError("evidence provenance fields must be exact")
+        source_id = value["source_id"]  # type: ignore[index]
+        blocks = value["evidence_blocks"]  # type: ignore[index]
+        if type(source_id) is not str:
+            raise TypeError("evidence provenance source id must be exact")
+        expected_container = list if info.mode == "json" else tuple
+        if type(blocks) is not expected_container:
+            raise TypeError("evidence provenance blocks container must be exact")
+        if any(type(block) is not str for block in blocks):
+            raise TypeError("evidence provenance blocks must be exact strings")
+        if info.mode == "json":
+            copied = dict(value)
+            copied["evidence_blocks"] = tuple(blocks)
+            return copied
+        return value
+
+    @field_validator("source_id")
+    @classmethod
+    def _validate_source_id(cls, value: str) -> str:
+        prefix = "evidence-source:"
+        suffix = value[len(prefix) :]
+        if (
+            not value.startswith(prefix)
+            or len(suffix) != 6
+            or not suffix.isascii()
+            or not suffix.isdigit()
+        ):
+            raise ValueError("evidence provenance source id is invalid")
+        order = int(suffix)
+        if not 1 <= order <= 200 or value != f"{prefix}{order:06d}":
+            raise ValueError("evidence provenance source id is invalid")
+        return value
+
+    @field_validator("evidence_blocks")
+    @classmethod
+    def _validate_evidence_blocks(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if not 1 <= len(values) <= 64:
+            raise ValueError("evidence provenance block count is invalid")
+        for block in values:
+            if not block.strip():
+                raise ValueError("evidence provenance block must not be blank")
+            if len(block) > 16384:
+                raise ValueError("evidence provenance block is too long")
+        return values
+
+
 class WorkflowResearchEvidence(_StrictWorkflowModel):
     evidence_id: Literal["evidence:000001"]
     topic_plan_id: Literal["topic-plan:000001"]
     attempt: FixedOne
     context_blocks: tuple[str, ...]
     sources: tuple[WorkflowEvidenceSource, ...]
+    provenance: tuple[WorkflowEvidenceProvenance, ...] = ()
+
+    @field_validator("provenance", mode="before")
+    @classmethod
+    def _require_exact_provenance_container(
+        cls, value: object, info: ValidationInfo
+    ) -> object:
+        expected_container = list if info.mode == "json" else tuple
+        if type(value) is not expected_container:
+            raise TypeError("evidence provenance container must be exact")
+        if info.mode != "json" and any(
+            type(item) is not WorkflowEvidenceProvenance for item in value
+        ):
+            raise TypeError("evidence provenance members must be exact")
+        if info.mode == "json":
+            return tuple(value)
+        return value
 
     @field_validator("context_blocks")
     @classmethod
@@ -237,6 +319,36 @@ class WorkflowResearchEvidence(_StrictWorkflowModel):
         if len(set(candidate_ids)) != len(candidate_ids):
             raise ValueError("candidate ids must be unique")
         return values
+
+    @model_validator(mode="after")
+    def _validate_provenance_binding(self) -> "WorkflowResearchEvidence":
+        if len(self.provenance) > 64:
+            raise ValueError("evidence provenance count is too large")
+        block_count = sum(
+            len(entry.evidence_blocks) for entry in self.provenance
+        )
+        if block_count > 64:
+            raise ValueError("evidence provenance block aggregate is too large")
+        character_count = sum(
+            len(block)
+            for entry in self.provenance
+            for block in entry.evidence_blocks
+        )
+        if character_count > 262144:
+            raise ValueError("evidence provenance character aggregate is too large")
+        source_positions = {
+            source.source_id: index for index, source in enumerate(self.sources)
+        }
+        positions: list[int] = []
+        seen_ids: set[str] = set()
+        for entry in self.provenance:
+            if entry.source_id in seen_ids or entry.source_id not in source_positions:
+                raise ValueError("evidence provenance source binding is invalid")
+            seen_ids.add(entry.source_id)
+            positions.append(source_positions[entry.source_id])
+        if positions != sorted(positions):
+            raise ValueError("evidence provenance source order is invalid")
+        return self
 
 
 class WorkflowOutlineSection(_StrictWorkflowModel):

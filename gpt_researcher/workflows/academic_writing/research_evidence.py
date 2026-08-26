@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Protocol
+from typing import Protocol, TypeAlias
 
 from gpt_researcher.screening.audit import (
     AUDIT_UNAVAILABLE_MESSAGE,
@@ -17,6 +17,7 @@ from .adapters import AcademicWritingAdapter
 from .state import (
     AcademicWorkflowRequest,
     AdapterFailure,
+    WorkflowEvidenceProvenance,
     WorkflowEvidenceSource,
     WorkflowOutline,
     WorkflowResearchEvidence,
@@ -37,7 +38,18 @@ _SOURCE_MAX_COUNT = 200
 _SOURCE_TITLE_MAX_CHARS = 512
 _SOURCE_URL_MAX_CHARS = 4096
 _SOURCE_CANDIDATE_ID_MAX_CHARS = 256
+_PROVENANCE_BLOCK_MAX_CHARS = 16384
+_PROVENANCE_BLOCK_MAX_COUNT = 64
+_PROVENANCE_TOTAL_MAX_CHARS = 262144
 _CONTRACT_FAILURE = object()
+
+
+_ResearchSourceRecord: TypeAlias = tuple[
+    str, str | None, dict[str, object], bool
+]
+_SourcePlanRecord: TypeAlias = tuple[
+    str, str, str | None, str, object | None
+]
 
 
 class _ResearcherConfigHandle(Protocol):
@@ -201,11 +213,11 @@ def _normalize_url(value: str) -> str | None:
     return normalized
 
 
-def _snapshot_research_sources(value: object) -> tuple[tuple[str, str | None], ...]:
+def _snapshot_research_sources(value: object) -> tuple[_ResearchSourceRecord, ...]:
     if type(value) is not list:
         raise TypeError("research sources must be an exact list")
     outer_snapshot = tuple(value)
-    projected: list[tuple[str, str | None]] = []
+    projected: list[_ResearchSourceRecord] = []
     for item in outer_snapshot:
         if type(item) is not dict:
             raise TypeError("research source members must be exact dicts")
@@ -217,8 +229,10 @@ def _snapshot_research_sources(value: object) -> tuple[tuple[str, str | None], .
         if "raw_content" in item:
             raw_content = item["raw_content"]
             usable = type(raw_content) is str and raw_content.strip() != ""
+            has_raw_content = usable
         else:
             usable = True
+            has_raw_content = False
         if not usable:
             continue
         url = _normalize_url(item["url"])
@@ -228,7 +242,7 @@ def _snapshot_research_sources(value: object) -> tuple[tuple[str, str | None], .
         if type(title_value) is str:
             normalized_title = title_value.strip()
             title = normalized_title or None
-        projected.append((url, title))
+        projected.append((url, title, item, has_raw_content))
     return tuple(projected)
 
 
@@ -247,10 +261,10 @@ def _snapshot_visited_urls(value: object) -> tuple[str, ...]:
 
 
 def _research_titles(
-    research_sources: tuple[tuple[str, str | None], ...]
+    research_sources: tuple[_ResearchSourceRecord, ...]
 ) -> dict[str, str | None]:
     titles_by_url: dict[str, list[str]] = {}
-    for url, title in research_sources:
+    for url, title, _, _ in research_sources:
         titles_by_url.setdefault(url, [])
         if title is not None:
             titles_by_url[url].append(title)
@@ -263,7 +277,7 @@ def _research_titles(
 def _audit_candidate_records(
     audit: PaperScreeningAuditSnapshot,
     candidates: tuple[PaperCandidate, ...],
-) -> tuple[tuple[str, str, str | None], ...]:
+) -> tuple[_SourcePlanRecord, ...]:
     routed_refs = audit.routed_canonical_occurrence_refs
     seen_refs: set[tuple[str, str]] = set()
     for ref in routed_refs:
@@ -293,7 +307,7 @@ def _audit_candidate_records(
             raise ValueError("audit occurrence identities must be unique")
         occurrence_by_key[key] = entry
 
-    records: list[tuple[str, str, str | None]] = []
+    records: list[_SourcePlanRecord] = []
     for ref in routed_refs:
         entry = occurrence_by_key.get((ref.web_pass_id, ref.occurrence_id))
         if (
@@ -302,36 +316,55 @@ def _audit_candidate_records(
             or entry.planning_only is not False
         ):
             raise ValueError("routed reference must resolve to routed evidence")
-        match_count = sum(
-            candidate.candidate_id == entry.candidate_id
-            and candidate.title == entry.title
-            and candidate.href == entry.href
-            for candidate in candidates
-        )
-        if match_count == 0:
+        winning_candidate: PaperCandidate | None = None
+        for candidate in candidates:
+            if (
+                candidate.candidate_id == entry.candidate_id
+                and candidate.title == entry.title
+                and candidate.href == entry.href
+            ):
+                winning_candidate = candidate
+                break
+        if winning_candidate is None:
             raise ValueError("routed audit candidate must resolve")
-        records.append((entry.href, entry.title, entry.candidate_id))
+        records.append(
+            (
+                entry.href,
+                entry.title,
+                entry.candidate_id,
+                "candidate",
+                winning_candidate,
+            )
+        )
     return tuple(records)
 
 
 def _candidate_records_without_audit(
     candidates: tuple[PaperCandidate, ...],
     usable_urls: set[str],
-) -> tuple[tuple[str, str, str | None], ...]:
-    records: list[tuple[str, str, str | None]] = []
+) -> tuple[_SourcePlanRecord, ...]:
+    records: list[_SourcePlanRecord] = []
     for candidate in candidates:
         url = _normalize_url(candidate.href)
         if url is not None and url in usable_urls:
-            records.append((candidate.href, candidate.title, candidate.candidate_id))
+            records.append(
+                (
+                    candidate.href,
+                    candidate.title,
+                    candidate.candidate_id,
+                    "candidate",
+                    candidate,
+                )
+            )
     return tuple(records)
 
 
-def _build_sources(
+def _build_source_plan(
     candidates: tuple[PaperCandidate, ...],
     audit: PaperScreeningAuditSnapshot | None,
-    research_sources: tuple[tuple[str, str | None], ...],
+    research_sources: tuple[_ResearchSourceRecord, ...],
     visited_urls: tuple[str, ...],
-) -> tuple[WorkflowEvidenceSource, ...]:
+) -> tuple[_SourcePlanRecord, ...]:
     selected_titles = _research_titles(research_sources)
     usable_urls = set(selected_titles)
     if audit is None:
@@ -339,17 +372,28 @@ def _build_sources(
     else:
         candidate_records = _audit_candidate_records(audit, candidates)
 
-    research_records = tuple(
-        (url, title if title is not None else url, None)
+    winning_research_records: dict[str, _ResearchSourceRecord] = {}
+    for record in research_sources:
+        winning_research_records.setdefault(record[0], record)
+    research_records: tuple[_SourcePlanRecord, ...] = tuple(
+        (
+            url,
+            title if title is not None else url,
+            None,
+            "research" if winning_research_records[url][3] else "none",
+            winning_research_records[url] if winning_research_records[url][3] else None,
+        )
         for url, title in sorted(selected_titles.items(), key=lambda item: (item[0], item[1] or ""))
     )
-    visited_records = tuple((url, url, None) for url in visited_urls)
+    visited_records: tuple[_SourcePlanRecord, ...] = tuple(
+        (url, url, None, "none", None) for url in visited_urls
+    )
     prioritized = candidate_records + research_records + visited_records
 
-    normalized_records: list[tuple[str, str, str | None]] = []
+    normalized_records: list[_SourcePlanRecord] = []
     seen_urls: set[str] = set()
     seen_candidate_ids: set[str] = set()
-    for raw_url, raw_title, raw_candidate_id in prioritized:
+    for raw_url, raw_title, raw_candidate_id, locator_kind, locator in prioritized:
         if type(raw_url) is not str or type(raw_title) is not str:
             raise TypeError("projected source fields must be exact strings")
         url = _normalize_url(raw_url)
@@ -373,9 +417,16 @@ def _build_sources(
         seen_urls.add(url)
         if candidate_id is not None:
             seen_candidate_ids.add(candidate_id)
-        normalized_records.append((url, title, candidate_id))
+        normalized_records.append(
+            (url, title, candidate_id, locator_kind, locator)
+        )
 
-    limited = normalized_records[:_SOURCE_MAX_COUNT]
+    return tuple(normalized_records[:_SOURCE_MAX_COUNT])
+
+
+def _sources_from_plan(
+    plan: tuple[_SourcePlanRecord, ...],
+) -> tuple[WorkflowEvidenceSource, ...]:
     return tuple(
         WorkflowEvidenceSource(
             source_id=f"evidence-source:{order:06d}",
@@ -384,8 +435,128 @@ def _build_sources(
             url=url,
             candidate_id=candidate_id,
         )
-        for order, (url, title, candidate_id) in enumerate(limited, start=1)
+        for order, (url, title, candidate_id, _, _) in enumerate(plan, start=1)
     )
+
+
+def _read_candidate_body(candidate: object) -> str:
+    if type(candidate) is not PaperCandidate:
+        raise TypeError("candidate provenance locator must be exact")
+    storage = object.__getattribute__(candidate, "__dict__")
+    if type(storage) is not dict or "body" not in storage:
+        raise TypeError("candidate body storage is invalid")
+    body = storage["body"]
+    if type(body) is not str:
+        raise TypeError("candidate body must be an exact string")
+    return body
+
+
+def _read_research_content(record: object) -> str:
+    if type(record) is not tuple or len(record) != 4:
+        raise TypeError("research provenance locator must be exact")
+    raw_source = record[2]
+    has_raw_content = record[3]
+    if type(raw_source) is not dict or has_raw_content is not True:
+        raise TypeError("research provenance locator is invalid")
+    if "raw_content" not in raw_source:
+        raise TypeError("research provenance content is missing")
+    raw_content = raw_source["raw_content"]
+    if type(raw_content) is not str:
+        raise TypeError("research provenance content must be exact")
+    return raw_content
+
+
+def _retainable_raw_bounds(text: str) -> tuple[int, int]:
+    start = 0
+    end = len(text)
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    if end <= start:
+        return start, start
+    return start, end - 1
+
+
+def _project_text_blocks(
+    text: str,
+    block_count: int,
+    character_count: int,
+) -> tuple[tuple[str, ...], int, int]:
+    if type(text) is not str:
+        raise TypeError("provenance text must be exact")
+    raw_index, retainable_end = _retainable_raw_bounds(text)
+    blocks: list[str] = []
+    while (
+        block_count < _PROVENANCE_BLOCK_MAX_COUNT
+        and character_count < _PROVENANCE_TOTAL_MAX_CHARS
+        and raw_index < retainable_end
+    ):
+        window_limit = min(
+            _PROVENANCE_BLOCK_MAX_CHARS,
+            _PROVENANCE_TOTAL_MAX_CHARS - character_count,
+        )
+        characters: list[str] = []
+        while raw_index < retainable_end and len(characters) < window_limit:
+            character = text[raw_index]
+            if character == "\r":
+                raw_index += 1
+                if raw_index < retainable_end and text[raw_index] == "\n":
+                    raw_index += 1
+                characters.append("\n")
+            else:
+                raw_index += 1
+                characters.append(character)
+        block = "".join(characters).strip()
+        if block:
+            if type(block) is not str:
+                raise TypeError("projected provenance block must be exact")
+            blocks.append(block)
+            block_count += 1
+            character_count += len(block)
+    return tuple(blocks), block_count, character_count
+
+
+def _project_provenance(
+    sources: tuple[WorkflowEvidenceSource, ...],
+    plan: tuple[_SourcePlanRecord, ...],
+) -> tuple[WorkflowEvidenceProvenance, ...]:
+    if len(sources) != len(plan):
+        raise ValueError("source provenance plan is inconsistent")
+    entries: list[WorkflowEvidenceProvenance] = []
+    block_count = 0
+    character_count = 0
+    index = 0
+    while (
+        block_count < _PROVENANCE_BLOCK_MAX_COUNT
+        and character_count < _PROVENANCE_TOTAL_MAX_CHARS
+        and index < len(plan)
+    ):
+        source = sources[index]
+        record = plan[index]
+        locator_kind = record[3]
+        locator = record[4]
+        if locator_kind == "candidate":
+            text = _read_candidate_body(locator)
+        elif locator_kind == "research":
+            text = _read_research_content(locator)
+        elif locator_kind == "none" and locator is None:
+            index += 1
+            continue
+        else:
+            raise ValueError("source provenance locator is invalid")
+        blocks, block_count, character_count = _project_text_blocks(
+            text, block_count, character_count
+        )
+        if blocks:
+            entries.append(
+                WorkflowEvidenceProvenance(
+                    source_id=source.source_id,
+                    evidence_blocks=blocks,
+                )
+            )
+        index += 1
+    return tuple(entries)
 
 
 def _build_evidence(
@@ -393,16 +564,19 @@ def _build_evidence(
     context_blocks: tuple[str, ...],
     candidates: tuple[PaperCandidate, ...],
     audit: PaperScreeningAuditSnapshot | None,
-    research_sources: tuple[tuple[str, str | None], ...],
+    research_sources: tuple[_ResearchSourceRecord, ...],
     visited_urls: tuple[str, ...],
 ) -> WorkflowResearchEvidence:
-    sources = _build_sources(candidates, audit, research_sources, visited_urls)
+    plan = _build_source_plan(candidates, audit, research_sources, visited_urls)
+    sources = _sources_from_plan(plan)
+    provenance = _project_provenance(sources, plan)
     return WorkflowResearchEvidence(
         evidence_id="evidence:000001",
         topic_plan_id=topic_plan.topic_plan_id,
         attempt=1,
         context_blocks=context_blocks,
         sources=sources,
+        provenance=provenance,
     )
 
 

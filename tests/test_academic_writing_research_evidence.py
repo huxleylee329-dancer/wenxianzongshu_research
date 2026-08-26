@@ -68,6 +68,7 @@ from gpt_researcher.workflows.academic_writing.state import (
     ThreadProtocolError,
     WorkflowOutline,
     WorkflowOutlineSection,
+    WorkflowEvidenceProvenance,
     WorkflowEvidenceSource,
     WorkflowResearchEvidence,
     WorkflowTopicPlan,
@@ -361,6 +362,7 @@ def _candidate(
     title: str = "Academic source",
     href: str = "https://paper.example/1",
     rank: int = 1,
+    body: str = "forbidden body",
 ) -> PaperCandidate:
     return PaperCandidate(
         candidate_id=candidate_id,
@@ -370,7 +372,7 @@ def _candidate(
         source_rank=rank,
         title=title,
         href=href,
-        body="forbidden body",
+        body=body,
         abstract="forbidden abstract",
     )
 
@@ -1127,6 +1129,288 @@ async def test_collect_order_context_and_deterministic_source_projection() -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "audit_multiple",
+        "ordinary_unusable_first",
+        "ordinary_url_only_first",
+        "candidate_without_fallback",
+        "visited_only",
+    ],
+)
+async def test_provenance_winner_and_no_backfill_matrix(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    module = importlib.import_module(
+        "gpt_researcher.workflows.academic_writing.research_evidence"
+    )
+    candidate_reads: list[object] = []
+    research_reads: list[object] = []
+    original_candidate_read = module._read_candidate_body
+    original_research_read = module._read_research_content
+
+    def read_candidate(candidate: object) -> str:
+        candidate_reads.append(candidate)
+        return original_candidate_read(candidate)
+
+    def read_research(record: object) -> str:
+        assert type(record) is tuple and len(record) == 4
+        research_reads.append(record[2])
+        return original_research_read(record)
+
+    monkeypatch.setattr(module, "_read_candidate_body", read_candidate)
+    monkeypatch.setattr(module, "_read_research_content", read_research)
+
+    expected_blocks: tuple[str, ...] = ()
+    expected_title: str
+    expected_candidate_reads: tuple[object, ...] = ()
+    expected_research_reads: tuple[object, ...] = ()
+    if case == "audit_multiple":
+        first = _candidate(rank=1, body="first")
+        second = _candidate(rank=2, body="second")
+        researcher = _Researcher(
+            candidates=(first, second), audit=_audit_for(first)
+        )
+        expected_blocks = ("firs",)
+        expected_title = first.title
+        expected_candidate_reads = (first,)
+    elif case == "ordinary_unusable_first":
+        first_record = {
+            "url": "https://duplicate.example",
+            "title": "Z",
+            "raw_content": None,
+        }
+        second_record = {
+            "url": "https://duplicate.example",
+            "title": "A",
+            "raw_content": "second",
+        }
+        researcher = _Researcher(research_sources=[first_record, second_record])
+        expected_blocks = ("secon",)
+        expected_title = "A"
+        expected_research_reads = (second_record,)
+    elif case == "ordinary_url_only_first":
+        first_record = {"url": "https://duplicate.example", "title": "Z"}
+        second_record = {
+            "url": "https://duplicate.example",
+            "title": "A",
+            "raw_content": "later",
+        }
+        researcher = _Researcher(research_sources=[first_record, second_record])
+        expected_title = "A"
+    elif case == "candidate_without_fallback":
+        candidate = _candidate(body="A")
+        researcher = _Researcher(
+            candidates=(candidate,),
+            research_sources=[
+                {"url": candidate.href, "raw_content": "ordinary fallback"}
+            ],
+        )
+        expected_title = candidate.title
+        expected_candidate_reads = (candidate,)
+    elif case == "visited_only":
+        researcher = _Researcher(visited=["https://visited.example"])
+        expected_title = "https://visited.example"
+    else:
+        raise AssertionError(f"unknown case: {case}")
+
+    adapter, _, _ = _adapter([researcher])
+    result = await adapter.collect_research_evidence(_request(), _plan())
+    assert type(result) is WorkflowResearchEvidence
+    assert len(result.sources) == 1
+    assert result.sources[0].source_id == "evidence-source:000001"
+    assert result.sources[0].title == expected_title
+    if expected_blocks:
+        assert len(result.provenance) == 1
+        entry = result.provenance[0]
+        assert type(entry) is WorkflowEvidenceProvenance
+        assert entry.source_id == result.sources[0].source_id
+        assert entry.evidence_blocks == expected_blocks
+    else:
+        assert result.provenance == ()
+    assert tuple(candidate_reads) == expected_candidate_reads
+    assert tuple(research_reads) == expected_research_reads
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "expected_blocks"),
+    [
+        ("", ()),
+        ("A", ()),
+        ("AB", ("A",)),
+        ("é😀", ("é",)),
+        ("AB\n", ("A",)),
+        ("A\0", ("A",)),
+        ("A\r\nB\rCZ", ("A\nB\nC",)),
+    ],
+)
+async def test_provenance_retainable_prefix_short_text_matrix(
+    body: str, expected_blocks: tuple[str, ...]
+) -> None:
+    candidate = _candidate(body=body)
+    researcher = _Researcher(
+        candidates=(candidate,), research_sources=[{"url": candidate.href}]
+    )
+    adapter, _, _ = _adapter([researcher])
+    result = await adapter.collect_research_evidence(_request(), _plan())
+    assert type(result) is WorkflowResearchEvidence
+    if expected_blocks:
+        assert result.provenance[0].evidence_blocks == expected_blocks
+        assert body not in result.model_dump_json()
+    else:
+        assert result.provenance == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case", ["split", "empty_window", "block_limit", "character_limit"]
+)
+async def test_provenance_chunk_and_aggregate_boundaries(case: str) -> None:
+    if case == "split":
+        body = ("x" * 16385) + "Z"
+        expected_lengths = (16384, 1)
+        expected_total = 16385
+    elif case == "empty_window":
+        body = ("A" * 16384) + (" " * 16384) + "TAILZ"
+        expected_lengths = (16384, 4)
+        expected_total = 16388
+    elif case == "block_limit":
+        body = (("A" + (" " * 16383)) * 64) + "Z"
+        expected_lengths = (1,) * 64
+        expected_total = 64
+    elif case == "character_limit":
+        body = ("\0" * 262144) + "Z"
+        expected_lengths = (16384,) * 16
+        expected_total = 262144
+    else:
+        raise AssertionError(f"unknown case: {case}")
+    candidate = _candidate(body=body)
+    researcher = _Researcher(
+        candidates=(candidate,), research_sources=[{"url": candidate.href}]
+    )
+    adapter, _, _ = _adapter([researcher])
+    result = await adapter.collect_research_evidence(_request(), _plan())
+    assert type(result) is WorkflowResearchEvidence
+    blocks = result.provenance[0].evidence_blocks
+    assert tuple(map(len, blocks)) == expected_lengths
+    assert sum(map(len, blocks)) == expected_total
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["candidate_and_audit", "research_source"])
+async def test_provenance_budget_stop_has_hostile_tail(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    for name in _HOSTILE_ACCESS_COUNTS:
+        _HOSTILE_ACCESS_COUNTS[name] = 0
+    module = importlib.import_module(
+        "gpt_researcher.workflows.academic_writing.research_evidence"
+    )
+    candidate_reads: list[object] = []
+    research_reads: list[object] = []
+    audit_reads = 0
+    audit_armed = False
+    original_candidate_read = module._read_candidate_body
+    original_research_read = module._read_research_content
+    original_project = module._project_provenance
+    original_audit_getattribute = PaperScreeningAuditSnapshot.__getattribute__
+
+    def read_candidate(candidate: object) -> str:
+        candidate_reads.append(candidate)
+        return original_candidate_read(candidate)
+
+    def read_research(record: object) -> str:
+        assert type(record) is tuple and len(record) == 4
+        research_reads.append(record[2])
+        return original_research_read(record)
+
+    def audit_getattribute(self: object, name: str) -> object:
+        nonlocal audit_reads
+        if audit_armed:
+            audit_reads += 1
+        return original_audit_getattribute(self, name)
+
+    def project(*args: object, **kwargs: object) -> object:
+        nonlocal audit_armed
+        audit_armed = True
+        try:
+            return original_project(*args, **kwargs)
+        finally:
+            audit_armed = False
+
+    monkeypatch.setattr(module, "_read_candidate_body", read_candidate)
+    monkeypatch.setattr(module, "_read_research_content", read_research)
+    monkeypatch.setattr(module, "_project_provenance", project)
+    monkeypatch.setattr(
+        PaperScreeningAuditSnapshot, "__getattribute__", audit_getattribute
+    )
+
+    hostile = _DescriptorHostile(object())
+    if case == "candidate_and_audit":
+        first = _candidate(
+            candidate_id="candidate-first",
+            href="https://a.example",
+            body=(("A" + (" " * 16383)) * 64) + "Z",
+        ).model_copy(update={"abstract": hostile})
+        second = _candidate(
+            candidate_id="candidate-second",
+            href="https://b.example",
+            rank=2,
+            body="unread tail",
+        ).model_copy(update={"body": hostile})
+        entries = (
+            _audit_entry(first, web_pass_id="web-pass:000001", occurrence_id="occurrence:000001"),
+            _audit_entry(second, web_pass_id="web-pass:000002", occurrence_id="occurrence:000002"),
+        )
+        refs = tuple(
+            PaperScreeningOccurrenceRef(
+                web_pass_id=entry.web_pass_id, occurrence_id=entry.occurrence_id
+            )
+            for entry in entries
+        )
+        researcher = _Researcher(
+            candidates=(first, second), audit=_audit_snapshot(entries, refs)
+        )
+        expected_candidate_reads = (first,)
+        expected_research_reads: tuple[object, ...] = ()
+    elif case == "research_source":
+        first_record = {
+            "url": "https://a.example",
+            "raw_content": ("\0" * 262144) + "Z",
+            "ignored": hostile,
+        }
+        second_record = {
+            "url": "https://b.example",
+            "raw_content": "unread tail",
+            "ignored": hostile,
+        }
+        researcher = _Researcher(research_sources=[first_record, second_record])
+        expected_candidate_reads = ()
+        expected_research_reads = (first_record,)
+    else:
+        raise AssertionError(f"unknown case: {case}")
+
+    adapter, _, _ = _adapter([researcher])
+    result = await adapter.collect_research_evidence(_request(), _plan())
+    assert type(result) is WorkflowResearchEvidence
+    assert len(result.sources) == 2
+    assert len(result.provenance) == 1
+    assert tuple(candidate_reads) == expected_candidate_reads
+    assert tuple(research_reads) == expected_research_reads
+    assert audit_reads == 0
+    assert _HOSTILE_ACCESS_COUNTS == {
+        "repr": 0,
+        "str": 0,
+        "getattribute": 0,
+        "iter": 0,
+        "property": 0,
+        "descriptor": 0,
+    }
+
+
+@pytest.mark.asyncio
 async def test_context_boundaries_source_limits_and_first_wins() -> None:
     context = "x" * 16385
     sources = [
@@ -1416,6 +1700,28 @@ async def test_empty_context_validates_all_getters_then_returns_only_failure() -
         ),
         (
             {"visited": ()},
+            ["conduct", "context", "candidates", "audit", "sources", "visited"],
+        ),
+        (
+            {
+                "candidates": (
+                    _candidate().model_copy(update={"body": object()}),
+                ),
+                "research_sources": [{"url": "https://paper.example/1"}],
+            },
+            ["conduct", "context", "candidates", "audit", "sources", "visited"],
+        ),
+        (
+            {
+                "candidates": (
+                    _candidate().model_copy(
+                        update={
+                            "body": type("BodyStringSubclass", (str,), {})("body")
+                        }
+                    ),
+                ),
+                "research_sources": [{"url": "https://paper.example/1"}],
+            },
             ["conduct", "context", "candidates", "audit", "sources", "visited"],
         ),
     ],
@@ -1870,6 +2176,13 @@ async def test_raw_content_secret_is_unreachable_from_dto_graph_and_checkpoint()
             candidate_id=None,
         ),
     )
+    assert state.research_evidence.provenance == (
+        WorkflowEvidenceProvenance(
+            source_id="evidence-source:000001",
+            evidence_blocks=(raw_secret[:-1],),
+        ),
+    )
+    assert raw_secret not in state.research_evidence.model_dump_json()
     graph_module = importlib.import_module(
         "gpt_researcher.workflows.academic_writing.graph"
     )
@@ -2011,12 +2324,22 @@ async def test_sensitive_live_surfaces_are_not_reachable_from_results_or_contrac
     raw_outer = type("RawSourceListSubclass", (list,), {})([_CONTRACT_SECRET])
     raw_dict = {"sentinel": _CONTRACT_SECRET}
     invalid_visited = (_CONTRACT_SECRET,)
+    corrupt_candidate = _candidate().model_copy(update={"body": _CONTRACT_SECRET})
     cases = (
         (_Researcher(candidates=(invalid_candidate,)), _plan(), invalid_candidate, "_candidates"),
         (_Researcher(audit=invalid_audit), _plan(), invalid_audit, "_audit"),
         (_Researcher(research_sources=raw_outer), _plan(), raw_outer, "_sources"),
         (_Researcher(research_sources=[raw_dict]), _plan(), raw_dict, "_sources"),
         (_Researcher(visited=invalid_visited), _plan(), invalid_visited, "_visited"),
+        (
+            _Researcher(
+                candidates=(corrupt_candidate,),
+                research_sources=[{"url": corrupt_candidate.href}],
+            ),
+            _plan(),
+            _CONTRACT_SECRET,
+            "_candidates",
+        ),
     )
     for researcher, topic_plan, sentinel, attribute in cases:
         adapter, _, _ = _adapter([researcher])

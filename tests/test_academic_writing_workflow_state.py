@@ -21,6 +21,7 @@ from gpt_researcher.workflows.academic_writing.state import (
     WorkflowOutlineDecisionRecord,
     WorkflowError,
     WorkflowEvent,
+    WorkflowEvidenceProvenance,
     WorkflowEvidenceSource,
     WorkflowOutline,
     WorkflowOutlineSection,
@@ -380,6 +381,255 @@ def test_evidence_collection_item_and_aggregate_limits() -> None:
     for changes in invalid_values:
         with pytest.raises(ValidationError):
             _evidence(**changes)
+
+
+def test_evidence_provenance_default_frozen_and_json_round_trip() -> None:
+    assert _evidence().provenance == ()
+    explicit_empty = _evidence(provenance=())
+    assert explicit_empty.provenance == ()
+    assert type(explicit_empty.provenance) is tuple
+    assert explicit_empty.model_dump(mode="json")["provenance"] == []
+    provenance = WorkflowEvidenceProvenance(
+        source_id="evidence-source:000001",
+        evidence_blocks=("bounded evidence",),
+    )
+    evidence = _evidence(provenance=(provenance,))
+    assert evidence.provenance == (provenance,)
+    assert evidence.model_dump(mode="json")["provenance"] == [
+        {
+            "source_id": "evidence-source:000001",
+            "evidence_blocks": ["bounded evidence"],
+        }
+    ]
+    restored = WorkflowResearchEvidence.model_validate_json(
+        evidence.model_dump_json()
+    )
+    assert restored == evidence
+    with pytest.raises(ValidationError):
+        provenance.evidence_blocks = ("changed",)  # type: ignore[misc]
+
+
+def test_evidence_provenance_strict_shapes_and_parent_binding_matrix() -> None:
+    class MappingSubclass(dict[str, object]):
+        pass
+
+    class TupleSubclass(tuple[object, ...]):
+        pass
+
+    class StringSubclass(str):
+        pass
+
+    valid: dict[str, object] = {
+        "source_id": "evidence-source:000001",
+        "evidence_blocks": ("block",),
+    }
+    invalid_nested = (
+        MappingSubclass(valid),
+        {**valid, "source_id": StringSubclass("evidence-source:000001")},
+        {**valid, "source_id": "evidence-source:000000"},
+        {**valid, "source_id": "evidence-source:000201"},
+        {**valid, "source_id": " evidence-source:000001 "},
+        {**valid, "evidence_blocks": ["block"]},
+        {**valid, "evidence_blocks": TupleSubclass(("block",))},
+        {**valid, "evidence_blocks": (StringSubclass("block"),)},
+        {**valid, "evidence_blocks": ()},
+        {**valid, "evidence_blocks": (" ",)},
+        {**valid, "evidence_blocks": ("x" * 16385,)},
+        {**valid, "evidence_blocks": ("x",) * 65},
+        {**valid, "extra": "forbidden"},
+    )
+    for payload in invalid_nested:
+        with pytest.raises((TypeError, ValidationError)):
+            WorkflowEvidenceProvenance.model_validate(payload)
+
+    restored = WorkflowEvidenceProvenance.model_validate_json(
+        json.dumps(
+            {
+                "source_id": "evidence-source:000001",
+                "evidence_blocks": ["block"],
+            }
+        )
+    )
+    assert restored.evidence_blocks == ("block",)
+    assert type(restored.evidence_blocks) is tuple
+
+    sources = tuple(_source(index) for index in range(1, 4))
+    first = WorkflowEvidenceProvenance(
+        source_id=sources[0].source_id, evidence_blocks=("first",)
+    )
+    second = WorkflowEvidenceProvenance(
+        source_id=sources[1].source_id, evidence_blocks=("second",)
+    )
+    third = WorkflowEvidenceProvenance(
+        source_id=sources[2].source_id, evidence_blocks=("third",)
+    )
+    assert _evidence(sources=sources, provenance=(first, third)).provenance == (
+        first,
+        third,
+    )
+    invalid_parent_values = (
+        None,
+        [first],
+        TupleSubclass((first,)),
+        (object(),),
+        (first, first),
+        (second, first),
+        (
+            WorkflowEvidenceProvenance(
+                source_id="evidence-source:000004", evidence_blocks=("unknown",)
+            ),
+        ),
+        (
+            WorkflowEvidenceProvenance(
+                source_id=first.source_id, evidence_blocks=("x" * 16384,) * 16
+            ),
+            WorkflowEvidenceProvenance(
+                source_id=second.source_id, evidence_blocks=("y",)
+            ),
+        ),
+    )
+    for provenance in invalid_parent_values:
+        with pytest.raises((TypeError, ValidationError)):
+            _evidence(sources=sources, provenance=provenance)
+
+    payload = _evidence().model_dump(mode="json")
+    for invalid_json in (None, {}, "value", True):
+        changed = dict(payload, provenance=invalid_json)
+        with pytest.raises((TypeError, ValidationError)):
+            WorkflowResearchEvidence.model_validate_json(json.dumps(changed))
+
+
+def test_evidence_provenance_exact_aggregate_boundaries() -> None:
+    sources = tuple(_source(index) for index in range(1, 66))
+    sixty_four_entries = tuple(
+        WorkflowEvidenceProvenance(
+            source_id=source.source_id, evidence_blocks=("x",)
+        )
+        for source in sources[:64]
+    )
+    assert len(_evidence(sources=sources, provenance=sixty_four_entries).provenance) == 64
+    with pytest.raises(ValidationError):
+        _evidence(
+            sources=sources,
+            provenance=sixty_four_entries
+            + (
+                WorkflowEvidenceProvenance(
+                    source_id=sources[64].source_id, evidence_blocks=("x",)
+                ),
+            ),
+        )
+
+    unicode_max = WorkflowEvidenceProvenance(
+        source_id=sources[0].source_id,
+        evidence_blocks=("😀" * 16384,),
+    )
+    assert len(unicode_max.evidence_blocks[0]) == 16384
+
+    character_max = WorkflowEvidenceProvenance(
+        source_id=sources[0].source_id,
+        evidence_blocks=("x" * 16384,) * 16,
+    )
+    assert sum(map(len, character_max.evidence_blocks)) == 262144
+    assert _evidence(sources=sources, provenance=(character_max,)).provenance == (
+        character_max,
+    )
+    with pytest.raises(ValidationError):
+        _evidence(
+            sources=sources,
+            provenance=(
+                character_max,
+                WorkflowEvidenceProvenance(
+                    source_id=sources[1].source_id, evidence_blocks=("y",)
+                ),
+            ),
+        )
+    with pytest.raises(ValidationError):
+        _evidence(
+            sources=sources,
+            provenance=(
+                WorkflowEvidenceProvenance(
+                    source_id=sources[0].source_id,
+                    evidence_blocks=("x",) * 64,
+                ),
+                WorkflowEvidenceProvenance(
+                    source_id=sources[1].source_id,
+                    evidence_blocks=("y",),
+                ),
+            ),
+        )
+
+
+def test_evidence_provenance_legacy_checkpoint_and_maximum_bytes() -> None:
+    legacy_state = _state(
+        phase="evidence_collected",
+        topic_plan=_plan(),
+        research_evidence=_evidence(),
+        events=EVIDENCE_EVENTS,
+    )
+    legacy_graph = workflow_to_graph_state(legacy_state)
+    evidence_payload = legacy_graph["workflow"]["research_evidence"]
+    assert type(evidence_payload) is dict
+    del evidence_payload["provenance"]
+    legacy_bytes = canonical_workflow_bytes(legacy_graph)
+    restored = restore_workflow_state(legacy_graph)
+    assert restored.schema_version == "1"
+    assert restored.research_evidence is not None
+    assert restored.research_evidence.provenance == ()
+    canonical_graph = workflow_to_graph_state(restored)
+    assert canonical_graph["workflow"]["research_evidence"]["provenance"] == []
+    canonical_bytes = canonical_workflow_bytes(canonical_graph)
+    assert canonical_bytes != legacy_bytes
+    rerestored = restore_workflow_state(canonical_graph)
+    assert rerestored == restored
+    assert canonical_workflow_bytes(workflow_to_graph_state(rerestored)) == canonical_bytes
+
+    controls = tuple(chr(index) for index in (*range(0, 8), *range(14, 28)))
+
+    def unique_control_string(index: int, length: int) -> str:
+        return (
+            "\0"
+            + controls[index // len(controls)]
+            + controls[index % len(controls)]
+            + ("\0" * (length - 3))
+        )
+
+    maximum_sources = tuple(
+        _source(
+            index,
+            title="\0" * 512,
+            url=unique_control_string(index - 1, 4096),
+            candidate_id=unique_control_string(index - 1, 256),
+        )
+        for index in range(1, 201)
+    )
+    maximum_blocks = (
+        ("\0" * 16384,) * 15
+        + ("\0",) * 48
+        + ("\0" * 16336,)
+    )
+    maximum_provenance = tuple(
+        WorkflowEvidenceProvenance(
+            source_id=maximum_sources[index].source_id,
+            evidence_blocks=(block,),
+        )
+        for index, block in enumerate(maximum_blocks)
+    )
+    maximum = WorkflowResearchEvidence(
+        evidence_id="evidence:000001",
+        topic_plan_id="topic-plan:000001",
+        attempt=1,
+        context_blocks=maximum_blocks,
+        sources=maximum_sources,
+        provenance=maximum_provenance,
+    )
+    encoded = json.dumps(
+        maximum.model_dump(mode="json"),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert len(encoded) == 9_004_507
 
 
 def test_failure_error_and_event_contracts_are_closed() -> None:
