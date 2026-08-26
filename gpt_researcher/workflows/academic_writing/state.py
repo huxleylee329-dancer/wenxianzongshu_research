@@ -19,6 +19,8 @@ from pydantic import (
     model_validator,
 )
 
+from .report_profiles import ReportMode, _get_report_profile, _is_known_section_role
+
 
 JsonValue: TypeAlias = (
     None | bool | int | str | list["JsonValue"] | dict[str, "JsonValue"]
@@ -100,6 +102,57 @@ class AcademicWorkflowRequest(_StrictWorkflowModel):
     document_urls: tuple[str, ...]
     query_domains: tuple[str, ...]
     max_search_results: PositiveStrictInt | None
+    report_mode: ReportMode = "freeform"
+    report_locale: Literal["zh-CN"] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_legacy_field_shape(
+        cls, value: object, info: ValidationInfo
+    ) -> object:
+        if type(value) is cls:
+            return value
+        if type(value) is not dict:
+            raise TypeError("workflow request must be an exact mapping")
+        keys = tuple(dict.keys(value))
+        if any(type(key) is not str for key in keys):
+            raise TypeError("workflow request keys must be exact strings")
+        old = {
+            "workflow_mode", "workflow_id", "thread_id", "run_id", "query",
+            "report_type", "report_source", "tone", "language", "source_urls",
+            "document_urls", "query_domains", "max_search_results",
+        }
+        supplied = set(keys)
+        allowed = (
+            old | {"report_mode", "report_locale"},
+            old | {"report_locale"},
+            old | {"report_mode"},
+            old,
+        )
+        if not any(supplied == shape for shape in allowed):
+            raise TypeError("workflow request fields are invalid")
+        if info.mode == "json":
+            copied = dict(value)
+            for name in ("source_urls", "document_urls", "query_domains"):
+                item = dict.__getitem__(copied, name)
+                if type(item) is list:
+                    copied[name] = tuple(item)
+            return copied
+        return value
+
+    @field_validator("report_mode", mode="before")
+    @classmethod
+    def _validate_report_mode_type(cls, value: object) -> object:
+        if type(value) is not str:
+            raise TypeError("report mode must be an exact string")
+        return value
+
+    @field_validator("report_locale", mode="before")
+    @classmethod
+    def _validate_report_locale_type(cls, value: object) -> object:
+        if value is not None and type(value) is not str:
+            raise TypeError("report locale must be an exact string or null")
+        return value
 
     @field_validator(
         "workflow_id",
@@ -124,6 +177,15 @@ class AcademicWorkflowRequest(_StrictWorkflowModel):
     @classmethod
     def _normalize_ordered_values(cls, values: tuple[str, ...]) -> tuple[str, ...]:
         return _normalize_unique_strings(values, "request collection")
+
+    @model_validator(mode="after")
+    def _validate_report_selection(self) -> "AcademicWorkflowRequest":
+        if self.report_mode == "freeform":
+            if self.report_locale is not None:
+                raise ValueError("freeform report locale must be null")
+        elif self.report_locale != "zh-CN":
+            raise ValueError("fixed report locale must be zh-CN")
+        return self
 
 
 class WorkflowTopicPlan(_StrictWorkflowModel):
@@ -356,6 +418,32 @@ class WorkflowOutlineSection(_StrictWorkflowModel):
     order: PositiveStrictInt
     title: str
     brief: str
+    section_role: str = "freeform"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_legacy_field_shape(
+        cls, value: object, info: ValidationInfo
+    ) -> object:
+        if type(value) is cls:
+            return value
+        if type(value) is not dict:
+            raise TypeError("outline section must be an exact mapping")
+        keys = tuple(dict.keys(value))
+        if any(type(key) is not str for key in keys):
+            raise TypeError("outline section keys must be exact strings")
+        old = {"section_id", "order", "title", "brief"}
+        supplied = set(keys)
+        if supplied not in (old, old | {"section_role"}):
+            raise TypeError("outline section fields are invalid")
+        return value
+
+    @field_validator("section_role", mode="before")
+    @classmethod
+    def _validate_section_role_type(cls, value: object) -> object:
+        if type(value) is not str:
+            raise TypeError("section role must be an exact string")
+        return value
 
     @field_validator("section_id", "title", "brief")
     @classmethod
@@ -366,6 +454,21 @@ class WorkflowOutlineSection(_StrictWorkflowModel):
     def _validate_derived_id(self) -> "WorkflowOutlineSection":
         if self.section_id != f"section:{self.order:06d}":
             raise ValueError("section id must match order")
+        role = self.section_role
+        if not 1 <= len(role) <= 48:
+            raise ValueError("section role length is invalid")
+        parts = role.split("_")
+        if any(
+            not part
+            or not part.isascii()
+            or not part[0].islower()
+            or not part[0].isalpha()
+            or any(not (character.islower() or character.isdigit()) for character in part)
+            for part in parts
+        ):
+            raise ValueError("section role is invalid")
+        if not _is_known_section_role(role):
+            raise ValueError("section role is unknown")
         return self
 
 
@@ -375,6 +478,52 @@ class WorkflowOutline(_StrictWorkflowModel):
     attempt: FixedOne
     title: str
     sections: tuple[WorkflowOutlineSection, ...]
+    report_mode: ReportMode = "freeform"
+    report_locale: Literal["zh-CN"] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_legacy_field_shape(
+        cls, value: object, info: ValidationInfo
+    ) -> object:
+        if type(value) is cls:
+            return value
+        if type(value) is not dict:
+            raise TypeError("outline must be an exact mapping")
+        keys = tuple(dict.keys(value))
+        if any(type(key) is not str for key in keys):
+            raise TypeError("outline keys must be exact strings")
+        old = {"outline_id", "evidence_id", "attempt", "title", "sections"}
+        supplied = set(keys)
+        allowed = (
+            old | {"report_mode", "report_locale"},
+            old | {"report_locale"},
+            old | {"report_mode"},
+            old,
+        )
+        if not any(supplied == shape for shape in allowed):
+            raise TypeError("outline fields are invalid")
+        if info.mode == "json":
+            copied = dict(value)
+            sections = dict.__getitem__(copied, "sections")
+            if type(sections) is list:
+                copied["sections"] = tuple(sections)
+            return copied
+        return value
+
+    @field_validator("report_mode", mode="before")
+    @classmethod
+    def _validate_report_mode_type(cls, value: object) -> object:
+        if type(value) is not str:
+            raise TypeError("report mode must be an exact string")
+        return value
+
+    @field_validator("report_locale", mode="before")
+    @classmethod
+    def _validate_report_locale_type(cls, value: object) -> object:
+        if value is not None and type(value) is not str:
+            raise TypeError("report locale must be an exact string or null")
+        return value
 
     @field_validator("title")
     @classmethod
@@ -399,6 +548,22 @@ class WorkflowOutline(_StrictWorkflowModel):
         if len(set(titles)) != len(titles):
             raise ValueError("outline section titles must be unique")
         return values
+
+    @model_validator(mode="after")
+    def _validate_profile(self) -> "WorkflowOutline":
+        if self.report_mode == "freeform":
+            if self.report_locale is not None or any(
+                section.section_role != "freeform" for section in self.sections
+            ):
+                raise ValueError("freeform outline profile is invalid")
+            return self
+        profile = _get_report_profile(self.report_mode)
+        if self.report_locale != "zh-CN" or profile is None:
+            raise ValueError("fixed outline profile is invalid")
+        actual = tuple((section.section_role, section.title) for section in self.sections)
+        if actual != profile:
+            raise ValueError("fixed outline sections do not match profile")
+        return self
 
 
 class WorkflowSectionDraft(_StrictWorkflowModel):
@@ -709,6 +874,26 @@ class AcademicWorkflowState(_StrictWorkflowModel):
             or self.outline.evidence_id != self.research_evidence.evidence_id
         ):
             raise ValueError("outline must reference evidence")
+        if self.outline is not None:
+            if (
+                self.request.report_mode != self.outline.report_mode
+                or self.request.report_locale != self.outline.report_locale
+            ):
+                raise ValueError("request and outline report profile must match")
+            if self.outline.report_mode == "freeform":
+                if any(
+                    section.section_role != "freeform"
+                    for section in self.outline.sections
+                ):
+                    raise ValueError("freeform outline profile is invalid")
+            else:
+                profile = _get_report_profile(self.outline.report_mode)
+                actual = tuple(
+                    (section.section_role, section.title)
+                    for section in self.outline.sections
+                )
+                if profile is None or actual != profile:
+                    raise ValueError("fixed outline profile is invalid")
 
         shape = (self.phase, self.status)
         expected_artifacts: tuple[bool, bool, bool]
@@ -877,7 +1062,24 @@ class OutlineDecisionProtocolError(RuntimeError):
 def _canonical_outline_bytes(outline: WorkflowOutline) -> bytes:
     if type(outline) is not WorkflowOutline:
         raise TypeError("outline must be an exact WorkflowOutline")
-    payload = outline.model_dump(mode="json")
+    if outline.report_mode == "freeform":
+        payload = {
+            "outline_id": outline.outline_id,
+            "evidence_id": outline.evidence_id,
+            "attempt": outline.attempt,
+            "title": outline.title,
+            "sections": [
+                {
+                    "section_id": section.section_id,
+                    "order": section.order,
+                    "title": section.title,
+                    "brief": section.brief,
+                }
+                for section in outline.sections
+            ],
+        }
+    else:
+        payload = outline.model_dump(mode="json")
     validate_json_value(payload)
     encoded = json.dumps(
         payload,
@@ -889,7 +1091,25 @@ def _canonical_outline_bytes(outline: WorkflowOutline) -> bytes:
     restored = WorkflowOutline.model_validate_json(encoded)
     if type(restored) is not WorkflowOutline or restored != outline:
         raise ValueError("outline canonical round trip changed the model")
-    restored_payload = restored.model_dump(mode="json")
+    restored_payload = (
+        {
+            "outline_id": restored.outline_id,
+            "evidence_id": restored.evidence_id,
+            "attempt": restored.attempt,
+            "title": restored.title,
+            "sections": [
+                {
+                    "section_id": section.section_id,
+                    "order": section.order,
+                    "title": section.title,
+                    "brief": section.brief,
+                }
+                for section in restored.sections
+            ],
+        }
+        if restored.report_mode == "freeform"
+        else restored.model_dump(mode="json")
+    )
     restored_encoded = json.dumps(
         restored_payload,
         ensure_ascii=False,
@@ -903,7 +1123,10 @@ def _canonical_outline_bytes(outline: WorkflowOutline) -> bytes:
 
 
 def _outline_digest(outline: WorkflowOutline) -> str:
-    return hashlib.sha256(_canonical_outline_bytes(outline)).hexdigest()
+    canonical = _canonical_outline_bytes(outline)
+    if outline.report_mode == "freeform":
+        return hashlib.sha256(canonical).hexdigest()
+    return hashlib.sha256(b"academic-fixed-profile-v1\0" + canonical).hexdigest()
 
 
 def _outline_digest_equal(left: str, right: str) -> bool:

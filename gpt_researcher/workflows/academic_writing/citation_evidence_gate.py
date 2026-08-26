@@ -177,6 +177,8 @@ _REQUEST_FIELDS = (
     "document_urls",
     "query_domains",
     "max_search_results",
+    "report_mode",
+    "report_locale",
 )
 _TOPIC_FIELDS = (
     "topic_plan_id",
@@ -196,8 +198,11 @@ _EVIDENCE_FIELDS = (
 )
 _SOURCE_FIELDS = ("source_id", "order", "title", "url", "candidate_id")
 _PROVENANCE_FIELDS = ("source_id", "evidence_blocks")
-_OUTLINE_FIELDS = ("outline_id", "evidence_id", "attempt", "title", "sections")
-_SECTION_FIELDS = ("section_id", "order", "title", "brief")
+_OUTLINE_FIELDS = (
+    "outline_id", "evidence_id", "attempt", "title", "sections",
+    "report_mode", "report_locale",
+)
+_SECTION_FIELDS = ("section_id", "order", "title", "brief", "section_role")
 _DECISION_FIELDS = (
     "decision_id",
     "schema_version",
@@ -264,7 +269,14 @@ def _copy_string_tuple(value: object) -> list[str] | _Marker:
 
 
 def _copy_request(value: object) -> dict[str, object] | _Marker:
-    surface = _surface(value, _AcademicWorkflowRequest, _REQUEST_FIELDS)
+    full = frozenset(_REQUEST_FIELDS)
+    old = frozenset(_REQUEST_FIELDS[:-2])
+    surface = _surface(
+        value,
+        _AcademicWorkflowRequest,
+        _REQUEST_FIELDS,
+        (full, old | {"report_mode"}, old | {"report_locale"}, old),
+    )
     if type(surface) is not tuple:
         return _FAILURE
     namespace, _ = surface
@@ -284,6 +296,12 @@ def _copy_request(value: object) -> dict[str, object] | _Marker:
     if maximum is not None and type(maximum) is not int:
         return _FAILURE
     copied["max_search_results"] = maximum
+    mode = dict.__getitem__(namespace, "report_mode")
+    locale = dict.__getitem__(namespace, "report_locale")
+    if type(mode) is not str or (locale is not None and type(locale) is not str):
+        return _FAILURE
+    copied["report_mode"] = mode
+    copied["report_locale"] = locale
     return copied
 
 
@@ -403,7 +421,13 @@ def _copy_evidence(value: object) -> dict[str, object] | _Marker:
 
 
 def _copy_outline_section(value: object) -> dict[str, object] | _Marker:
-    surface = _surface(value, _WorkflowOutlineSection, _SECTION_FIELDS)
+    full = frozenset(_SECTION_FIELDS)
+    surface = _surface(
+        value,
+        _WorkflowOutlineSection,
+        _SECTION_FIELDS,
+        (full, frozenset(_SECTION_FIELDS[:-1])),
+    )
     if type(surface) is not tuple:
         return _FAILURE
     namespace, _ = surface
@@ -411,11 +435,13 @@ def _copy_outline_section(value: object) -> dict[str, object] | _Marker:
     order = dict.__getitem__(namespace, "order")
     title = dict.__getitem__(namespace, "title")
     brief = dict.__getitem__(namespace, "brief")
+    role = dict.__getitem__(namespace, "section_role")
     if (
         type(section_id) is not str
         or type(order) is not int
         or type(title) is not str
         or type(brief) is not str
+        or type(role) is not str
     ):
         return _FAILURE
     return {
@@ -423,11 +449,19 @@ def _copy_outline_section(value: object) -> dict[str, object] | _Marker:
         "order": order,
         "title": title,
         "brief": brief,
+        "section_role": role,
     }
 
 
 def _copy_outline(value: object) -> dict[str, object] | _Marker:
-    surface = _surface(value, _WorkflowOutline, _OUTLINE_FIELDS)
+    full = frozenset(_OUTLINE_FIELDS)
+    old = frozenset(_OUTLINE_FIELDS[:-2])
+    surface = _surface(
+        value,
+        _WorkflowOutline,
+        _OUTLINE_FIELDS,
+        (full, old | {"report_mode"}, old | {"report_locale"}, old),
+    )
     if type(surface) is not tuple:
         return _FAILURE
     namespace, _ = surface
@@ -436,12 +470,16 @@ def _copy_outline(value: object) -> dict[str, object] | _Marker:
     attempt = dict.__getitem__(namespace, "attempt")
     title = dict.__getitem__(namespace, "title")
     sections = dict.__getitem__(namespace, "sections")
+    mode = dict.__getitem__(namespace, "report_mode")
+    locale = dict.__getitem__(namespace, "report_locale")
     if (
         type(outline_id) is not str
         or type(evidence_id) is not str
         or type(attempt) is not int
         or type(title) is not str
         or type(sections) is not tuple
+        or type(mode) is not str
+        or (locale is not None and type(locale) is not str)
     ):
         return _FAILURE
     copied_sections: list[dict[str, object]] = []
@@ -456,6 +494,8 @@ def _copy_outline(value: object) -> dict[str, object] | _Marker:
         "attempt": attempt,
         "title": title,
         "sections": copied_sections,
+        "report_mode": mode,
+        "report_locale": locale,
     }
 
 

@@ -60,6 +60,9 @@ from gpt_researcher.workflows.academic_writing.graph import (
     resume_academic_workflow,
     start_academic_workflow,
 )
+from gpt_researcher.workflows.academic_writing.report_profiles import (
+    _get_report_profile,
+)
 from gpt_researcher.workflows.academic_writing.state import (
     AcademicWorkflowIdentity,
     AcademicWorkflowRequest,
@@ -323,6 +326,8 @@ def _request(**changes: object) -> AcademicWorkflowRequest:
         "document_urls": ("https://doc.example",),
         "query_domains": ("example.org",),
         "max_search_results": 7,
+        "report_mode": "stem_literature_review",
+        "report_locale": "zh-CN",
     }
     values.update(changes)
     return AcademicWorkflowRequest(**values)
@@ -340,19 +345,25 @@ def _plan() -> WorkflowTopicPlan:
 
 
 def _outline() -> WorkflowOutline:
+    profile = _get_report_profile("stem_literature_review")
+    assert profile is not None
     return WorkflowOutline(
         outline_id="outline:000001",
         evidence_id="evidence:000001",
         attempt=1,
         title="Outline",
-        sections=(
+        sections=tuple(
             WorkflowOutlineSection(
-                section_id="section:000001",
-                order=1,
-                title="Section",
-                brief="Brief",
-            ),
+                section_id=f"section:{order:06d}",
+                order=order,
+                title=title,
+                brief=f"Brief {order}",
+                section_role=role,
+            )
+            for order, (role, title) in enumerate(profile, start=1)
         ),
+        report_mode="stem_literature_review",
+        report_locale="zh-CN",
     )
 
 

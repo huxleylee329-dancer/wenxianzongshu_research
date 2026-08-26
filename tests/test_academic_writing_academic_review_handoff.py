@@ -45,6 +45,10 @@ from gpt_researcher.workflows.academic_writing.state import (
     WorkflowResearchEvidence,
     WorkflowSectionDraft,
     WorkflowTopicPlan,
+    _outline_digest,
+)
+from gpt_researcher.workflows.academic_writing.report_profiles import (
+    _get_report_profile,
 )
 
 
@@ -165,7 +169,7 @@ def _approved_state(
         title="O",
         sections=sections,
     )
-    outline_digest = hashlib.sha256(_canonical(outline)).hexdigest()
+    outline_digest = _outline_digest(outline)
     decision = WorkflowOutlineDecisionRecord(
         decision_id="outline-decision:000001",
         schema_version="1",
@@ -823,3 +827,42 @@ def test_joint_natural_maximum_is_publicly_reachable() -> None:
     assert len(_canonical(dumped["cited_sources"])) == 1873400
     assert len(_canonical(dumped["cited_provenance"])) == 1576833
     assert len(_canonical(dumped)) == 4977282
+
+
+def test_fixed_profile_state_builds_same_non_ready_handoff_projection() -> None:
+    state = _approved_state(section_count=8)
+    profile = _get_report_profile("stem_literature_review")
+    assert profile is not None and state.outline is not None
+    request_namespace = object.__getattribute__(state.request, "__dict__")
+    dict.__setitem__(request_namespace, "report_mode", "stem_literature_review")
+    dict.__setitem__(request_namespace, "report_locale", "zh-CN")
+    request_fields = object.__getattribute__(state.request, "__pydantic_fields_set__")
+    set.add(request_fields, "report_mode")
+    set.add(request_fields, "report_locale")
+    outline_namespace = object.__getattribute__(state.outline, "__dict__")
+    dict.__setitem__(outline_namespace, "report_mode", "stem_literature_review")
+    dict.__setitem__(outline_namespace, "report_locale", "zh-CN")
+    outline_fields = object.__getattribute__(state.outline, "__pydantic_fields_set__")
+    set.add(outline_fields, "report_mode")
+    set.add(outline_fields, "report_locale")
+    for section, (role, title) in zip(state.outline.sections, profile, strict=True):
+        namespace = object.__getattribute__(section, "__dict__")
+        dict.__setitem__(namespace, "section_role", role)
+        dict.__setitem__(namespace, "title", title)
+        set.add(
+            object.__getattribute__(section, "__pydantic_fields_set__"),
+            "section_role",
+        )
+    assert state.outline_decision is not None
+    dict.__setitem__(
+        object.__getattribute__(state.outline_decision, "__dict__"),
+        "outline_digest",
+        _outline_digest(state.outline),
+    )
+    composition = _composition(state, verdict="uncertain")
+    handoff = build_academic_review_handoff(state, composition)
+    assert handoff.composition is composition
+    assert handoff.cited_sources == (state.research_evidence.sources[0],)  # type: ignore[union-attr]
+    assert handoff.cited_provenance == (
+        state.research_evidence.provenance[0],  # type: ignore[union-attr]
+    )

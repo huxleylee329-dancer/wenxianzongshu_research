@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import builtins
-import hashlib
 import importlib
 import inspect
 import json
@@ -17,6 +16,7 @@ import pytest
 from gpt_researcher.workflows.academic_writing import (
     section_writer_sequence as module,
 )
+from gpt_researcher.workflows.academic_writing import graph as graph_module
 from gpt_researcher.workflows.academic_writing.section_writer_sequence import (
     GPTResearcherSectionWriterSequence,
 )
@@ -122,13 +122,6 @@ def _approved_state(
             for index in range(1, section_count + 1)
         ),
     )
-    outline_bytes = json.dumps(
-        outline.model_dump(mode="json"),
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
     decision = WorkflowOutlineDecisionRecord(
         decision_id="outline-decision:000001",
         schema_version="1",
@@ -136,7 +129,7 @@ def _approved_state(
         thread_id="thread-1",
         run_id="run-1",
         outline_id="outline:000001",
-        outline_digest=hashlib.sha256(outline_bytes).hexdigest(),
+        outline_digest=graph_module._outline_digest(outline),
         decision="approve" if approved else "reject",
         actor_assertion="actor-A",
         attempt=1,

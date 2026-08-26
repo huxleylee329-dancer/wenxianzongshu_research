@@ -54,6 +54,9 @@ from gpt_researcher.workflows.academic_writing.graph import (
     resume_academic_workflow,
     start_academic_workflow,
 )
+from gpt_researcher.workflows.academic_writing.report_profiles import (
+    _get_report_profile,
+)
 from gpt_researcher.workflows.academic_writing.state import (
     AcademicWorkflowIdentity,
     AcademicWorkflowRequest,
@@ -367,6 +370,41 @@ def _response(
     )
 
 
+def _fixed_request(**changes: object) -> AcademicWorkflowRequest:
+    return _request(
+        report_mode="stem_literature_review",
+        report_locale="zh-CN",
+        **changes,
+    )
+
+
+def _fixed_response(
+    mode: str = "stem_literature_review",
+    *,
+    roles: tuple[str, ...] | None = None,
+    briefs: tuple[str, ...] | None = None,
+) -> str:
+    profile = _get_report_profile(mode)
+    assert profile is not None
+    selected_roles = roles or tuple(role for role, _title in profile)
+    selected_briefs = briefs or tuple(
+        f"Brief {order}" for order in range(1, len(selected_roles) + 1)
+    )
+    return json.dumps(
+        {
+            "sections": [
+                {"brief": brief, "role": role}
+                for role, brief in zip(selected_roles, selected_briefs, strict=True)
+            ],
+            "title": "Paper title",
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 class _Delegate(AcademicWritingAdapter):
     def __init__(self) -> None:
         self.plan_result: object = _plan()
@@ -403,6 +441,7 @@ class _Client:
         error: BaseException | None = None,
         gate: asyncio.Event | None = None,
     ) -> None:
+        self.uses_default = response is _DEFAULT_RESPONSE
         self.response = _response() if response is _DEFAULT_RESPONSE else response
         self.error = error
         self.gate = gate
@@ -2894,6 +2933,9 @@ def test_canonical_import_success_and_loader_failure_share_restoration(
 
 
 def _graph_adapter(clients: list[_Client]):
+    for client in clients:
+        if client.uses_default:
+            client.response = _fixed_response()
     delegate = _Delegate()
     factory = _Factory(clients)
     adapter = GPTResearcherOutlineWriterAdapter(
@@ -2930,7 +2972,7 @@ async def test_real_adapter_graph_success_failure_raw_resume_and_snapshots() -> 
     success_client = _Client()
     success_adapter, success_delegate, success_factory = _graph_adapter([success_client])
     success = await start_academic_workflow(
-        _request(thread_id="real-success"), success_adapter, checkpointer=saver
+        _fixed_request(thread_id="real-success"), success_adapter, checkpointer=saver
     )
     assert _event_pairs(success) == _SUCCESS_EVENT_GOLDEN
     assert success_factory.calls == 1
@@ -2943,7 +2985,7 @@ async def test_real_adapter_graph_success_failure_raw_resume_and_snapshots() -> 
     failure_adapter, failure_delegate, failure_factory = _graph_adapter(
         [failure_client]
     )
-    failed_request = _request(thread_id="real-failure")
+    failed_request = _fixed_request(thread_id="real-failure")
     failed = await start_academic_workflow(
         failed_request, failure_adapter, checkpointer=saver
     )
@@ -2998,7 +3040,7 @@ async def test_real_adapter_graph_success_failure_raw_resume_and_snapshots() -> 
     crash_adapter, crash_delegate, crash_factory = _graph_adapter(
         [crash_client, _Client()]
     )
-    crash_request = _request(thread_id="real-crash")
+    crash_request = _fixed_request(thread_id="real-crash")
     caught = await _capture_async_exception(
         start_academic_workflow(crash_request, crash_adapter, checkpointer=saver)
     )
@@ -3063,7 +3105,7 @@ async def test_real_adapter_facade_cancellation_and_at_least_once_contract_resum
     cancel_adapter, cancel_delegate, cancel_factory = _graph_adapter(
         [cancel_client, _Client()]
     )
-    request = _request(thread_id="real-cancel")
+    request = _fixed_request(thread_id="real-cancel")
     task = asyncio.create_task(
         start_academic_workflow(request, cancel_adapter, checkpointer=saver)
     )
@@ -3120,7 +3162,7 @@ async def test_real_adapter_facade_cancellation_and_at_least_once_contract_resum
     contract_adapter, contract_delegate, contract_factory = _graph_adapter(
         [contract_client_one, contract_client_two]
     )
-    contract_request = _request(thread_id="real-contract")
+    contract_request = _fixed_request(thread_id="real-contract")
     original_build = module.__dict__["_build_outline"]
     build_calls = 0
 
@@ -4129,3 +4171,157 @@ def test_runtime_observation_is_identity_only_and_calls_no_object_method(
     )
     assert _runtime_observation_matches(snapshot)
     assert calls == {name: 0 for name in calls}
+
+
+@pytest.mark.parametrize(
+    ("mode", "count"),
+    (
+        ("stem_literature_review", 8),
+        ("technical_route_survey", 9),
+        ("method_comparison", 9),
+        ("equipment_material_selection", 10),
+        ("proposal_research_status", 9),
+        ("systematic_literature_review", 10),
+    ),
+)
+@pytest.mark.asyncio
+async def test_fixed_profile_writer_golden_matrix(mode: str, count: int) -> None:
+    profile = _get_report_profile(mode)
+    assert profile is not None and len(profile) == count
+    client = _Client(response=_fixed_response(mode))
+    adapter, delegate, factory = _adapter(client)
+    request = _request(report_mode=mode, report_locale="zh-CN")
+    result = await adapter.write_outline(request, _plan(), _evidence())
+    assert type(result) is WorkflowOutline
+    assert result.report_mode == mode and result.report_locale == "zh-CN"
+    assert tuple(
+        (section.section_role, section.title) for section in result.sections
+    ) == profile
+    assert tuple(section.section_id for section in result.sections) == tuple(
+        f"section:{order:06d}" for order in range(1, count + 1)
+    )
+    assert factory.calls == 1 and len(client.calls) == 1
+    prompt = json.loads(client.calls[0][1])
+    assert tuple(
+        (item["role"], item["title"]) for item in prompt["section_profile"]
+    ) == profile
+    assert delegate.outline_calls == 0
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("missing", "extra", "duplicate", "renamed", "freeform", "unknown", "reordered"),
+)
+@pytest.mark.asyncio
+async def test_fixed_profile_response_role_matrix(case: str) -> None:
+    profile = _get_report_profile("stem_literature_review")
+    assert profile is not None
+    roles = [role for role, _title in profile]
+    if case == "missing":
+        roles.pop()
+    elif case == "extra":
+        roles.append("extra_role")
+    elif case == "duplicate":
+        roles[1] = roles[0]
+    elif case == "renamed":
+        roles[0] = "renamed_role"
+    elif case == "freeform":
+        roles[0] = "freeform"
+    elif case == "unknown":
+        roles[0] = "unknown"
+    else:
+        roles[0], roles[1] = roles[1], roles[0]
+    response = _fixed_response(
+        roles=tuple(roles),
+        briefs=tuple("b" for _role in roles),
+    )
+    client = _Client(response=response)
+    adapter, _delegate, factory = _adapter(client)
+    result = await adapter.write_outline(_fixed_request(), _plan(), _evidence())
+    assert result == AdapterFailure(code="outline_writing_failed")
+    assert factory.calls == 1 and len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_fixed_profile_brief_prompt_and_raw_response_boundaries() -> None:
+    equipment = _get_report_profile("equipment_material_selection")
+    assert equipment is not None
+    briefs = tuple(["b" * 1024] * 7 + ["b" * 1022, "x", "y"])
+    client = _Client(
+        response=_fixed_response(
+            "equipment_material_selection",
+            briefs=briefs,
+        )
+    )
+    adapter, _delegate, factory = _adapter(client)
+    result = await adapter.write_outline(
+        _request(
+            report_mode="equipment_material_selection",
+            report_locale="zh-CN",
+        ),
+        _plan(),
+        _evidence(),
+    )
+    assert type(result) is WorkflowOutline
+    assert sum(len(section.brief) for section in result.sections) == 8192
+    assert factory.calls == 1
+
+    query = "\0" * 4096
+    boundary_request = _request(
+        query=query,
+        language="a" * 128,
+        report_mode="equipment_material_selection",
+        report_locale="zh-CN",
+    )
+    boundary_plan = _plan(
+        research_topic=query,
+        research_questions=("q" * 512,),
+    )
+    success_evidence = _evidence(
+        context_blocks=(
+            "\0" * 4096,
+            "\0" * 1371 + "a" * 2725,
+            "a" * 4091,
+        ),
+        sources=(),
+    )
+    success_client = _Client(response=_fixed_response("equipment_material_selection"))
+    success_adapter, _delegate, success_factory = _adapter(success_client)
+    success = await success_adapter.write_outline(
+        boundary_request, boundary_plan, success_evidence
+    )
+    assert type(success) is WorkflowOutline
+    assert len(success_client.calls[0][1]) == 65536
+    assert success_factory.calls == 1
+
+    rejected_client = _Client(response=_fixed_response("equipment_material_selection"))
+    rejected_adapter, _delegate, rejected_factory = _adapter(rejected_client)
+    with pytest.raises(ValueError, match="user message exceeds 65536 characters"):
+        await rejected_adapter.write_outline(
+            boundary_request,
+            boundary_plan,
+            _evidence(
+                context_blocks=(
+                    "\0" * 4096,
+                    "\0" * 1371 + "a" * 2725,
+                    "a" * 4092,
+                ),
+                sources=(),
+            ),
+        )
+    assert rejected_factory.calls == 0 and rejected_client.calls == []
+
+    base = _fixed_response()
+    exact_raw = base + " " * (24576 - len(base))
+    raw_client = _Client(response=exact_raw)
+    raw_adapter, _delegate, raw_factory = _adapter(raw_client)
+    assert type(
+        await raw_adapter.write_outline(_fixed_request(), _plan(), _evidence())
+    ) is WorkflowOutline
+    assert raw_factory.calls == 1
+    too_long_client = _Client(response=exact_raw + " ")
+    too_long_adapter, _delegate, too_long_factory = _adapter(too_long_client)
+    assert await too_long_adapter.write_outline(
+        _fixed_request(), _plan(), _evidence()
+    ) == AdapterFailure(code="outline_writing_failed")
+    assert too_long_factory.calls == 1

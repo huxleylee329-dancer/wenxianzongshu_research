@@ -24,17 +24,23 @@ import pytest
 import pytest_asyncio
 from langgraph.checkpoint.memory import InMemorySaver
 
+from gpt_researcher.workflows.academic_writing import graph as graph_module
+from gpt_researcher.workflows.academic_writing import nodes as nodes_module
+from gpt_researcher.workflows.academic_writing import state as state_module
 from gpt_researcher.workflows.academic_writing.adapters import AcademicWritingAdapter
 from gpt_researcher.workflows.academic_writing.graph import (
     resume_academic_workflow,
     start_academic_workflow,
+    submit_academic_outline_decision,
 )
 from gpt_researcher.workflows.academic_writing.state import (
+    AcademicOutlineDecisionCommand,
     AcademicWorkflowIdentity,
     AcademicWorkflowRequest,
     AdapterFailure,
     ExecutionError,
     InvariantError,
+    OutlineDecisionProtocolError,
     ThreadProtocolError,
     WorkflowEvidenceSource,
     WorkflowOutline,
@@ -42,6 +48,9 @@ from gpt_researcher.workflows.academic_writing.state import (
     WorkflowResearchEvidence,
     WorkflowTopicPlan,
     restore_workflow_state,
+)
+from gpt_researcher.workflows.academic_writing.report_profiles import (
+    _get_report_profile,
 )
 
 
@@ -188,6 +197,8 @@ def _request(**changes: Any) -> AcademicWorkflowRequest:
         "document_urls": (),
         "query_domains": (),
         "max_search_results": None,
+        "report_mode": "stem_literature_review",
+        "report_locale": "zh-CN",
     }
     data.update(changes)
     return AcademicWorkflowRequest(**data)
@@ -236,18 +247,26 @@ def _evidence(**changes: Any) -> WorkflowResearchEvidence:
 
 
 def _outline(**changes: Any) -> WorkflowOutline:
-    section = WorkflowOutlineSection(
-        section_id="section:000001",
-        order=1,
-        title="Section",
-        brief="Brief",
+    profile = _get_report_profile("stem_literature_review")
+    assert profile is not None
+    sections = tuple(
+        WorkflowOutlineSection(
+            section_id=f"section:{order:06d}",
+            order=order,
+            title=title,
+            brief=f"Brief {order}",
+            section_role=role,
+        )
+        for order, (role, title) in enumerate(profile, start=1)
     )
     data: dict[str, Any] = {
         "outline_id": "outline:000001",
         "evidence_id": "evidence:000001",
         "attempt": 1,
         "title": "Outline",
-        "sections": (section,),
+        "sections": sections,
+        "report_mode": "stem_literature_review",
+        "report_locale": "zh-CN",
     }
     data.update(changes)
     return WorkflowOutline(**data)
@@ -659,9 +678,33 @@ async def test_adapter_constructed_cancelled_error_is_an_invariant() -> None:
 
 
 @pytest.mark.asyncio
-async def test_start_and_resume_thread_guards_use_fixed_priority() -> None:
+async def test_start_and_resume_thread_guards_use_fixed_priority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_outline_digest = state_module._outline_digest
+    digest_calls: list[tuple[str, str]] = []
+    stage = "approval_create"
+
+    def counting_outline_digest(outline: WorkflowOutline) -> str:
+        assert state_module._outline_digest is counting_outline_digest
+        assert nodes_module._outline_digest is counting_outline_digest
+        assert graph_module._outline_digest is counting_outline_digest
+        digest = real_outline_digest(outline)
+        digest_calls.append((stage, digest))
+        return digest
+
+    monkeypatch.setattr(state_module, "_outline_digest", counting_outline_digest)
+    monkeypatch.setattr(nodes_module, "_outline_digest", counting_outline_digest)
+    monkeypatch.setattr(graph_module, "_outline_digest", counting_outline_digest)
+
     saver = InMemorySaver()
-    await start_academic_workflow(_request(), FakeAdapter(), checkpointer=saver)
+    paused = await start_academic_workflow(
+        _request(), FakeAdapter(), checkpointer=saver
+    )
+    assert [name for name, _digest in digest_calls] == [
+        "approval_create",
+        "approval_create",
+    ]
 
     with pytest.raises(ThreadProtocolError, match="^academic workflow thread already exists$"):
         await start_academic_workflow(_request(), FakeAdapter(), checkpointer=saver)
@@ -683,6 +726,7 @@ async def test_start_and_resume_thread_guards_use_fixed_priority() -> None:
             FakeAdapter(),
             checkpointer=saver,
         )
+    stage = "checkpoint_restore"
     with pytest.raises(
         ThreadProtocolError,
         match="^academic outline approval decision is required$",
@@ -690,6 +734,7 @@ async def test_start_and_resume_thread_guards_use_fixed_priority() -> None:
         await resume_academic_workflow(
             _identity(), FakeAdapter(), checkpointer=saver
         )
+    assert [name for name, _digest in digest_calls].count("checkpoint_restore") == 1
 
     with pytest.raises(
         ThreadProtocolError,
@@ -700,6 +745,57 @@ async def test_start_and_resume_thread_guards_use_fixed_priority() -> None:
             FakeAdapter(),
             checkpointer=saver,
         )
+
+    command = AcademicOutlineDecisionCommand(
+        schema_version="1",
+        workflow_id=paused.workflow_id,
+        thread_id=paused.thread_id,
+        run_id=paused.run_id,
+        outline_id="outline:000001",
+        outline_digest=digest_calls[0][1],
+        decision="approve",
+        actor_assertion="human approval",
+    )
+    stage = "approval_resume"
+    approved = await submit_academic_outline_decision(
+        command,
+        FakeAdapter(),
+        checkpointer=saver,
+    )
+    assert (approved.phase, approved.status) == ("outline_approved", "completed")
+    assert [name for name, _digest in digest_calls] == [
+        "approval_create",
+        "approval_create",
+        "checkpoint_restore",
+        "approval_resume",
+        "approval_resume",
+        "approval_resume",
+        "approval_resume",
+        "approval_resume",
+        "approval_resume",
+        "approval_resume",
+    ]
+
+    stage = "checkpoint_restore"
+    terminal_snapshot = await _compiled_for_test(
+        FakeAdapter(), saver
+    ).aget_state({"configurable": {"thread_id": "thread-1"}})
+    restored = restore_workflow_state(terminal_snapshot.values)
+    assert restored == approved
+    assert [name for name, _digest in digest_calls].count("checkpoint_restore") == 2
+
+    stage = "retry"
+    with pytest.raises(
+        OutlineDecisionProtocolError,
+        match="^academic outline decision has already been committed$",
+    ):
+        await submit_academic_outline_decision(
+            command,
+            FakeAdapter(),
+            checkpointer=saver,
+        )
+    assert [name for name, _digest in digest_calls].count("retry") == 1
+    assert len({digest for _name, digest in digest_calls}) == 1
 
 
 @pytest.mark.asyncio
@@ -930,3 +1026,62 @@ def test_new_modules_do_not_import_legacy_or_external_components() -> None:
         assert "multi_agents" not in source
         assert "GPTResearcher" not in source
         assert "ResearchConductor" not in source
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "missing_mode",
+        "missing_locale",
+        "freeform",
+        "none_locale",
+        "unknown",
+        "case",
+        "whitespace",
+        "subclass",
+    ),
+)
+@pytest.mark.asyncio
+async def test_new_start_requires_explicit_fixed_profile_and_exact_locale(
+    case: str,
+) -> None:
+    saver = InMemorySaver()
+    adapter = FakeAdapter()
+    request = _request(thread_id=f"profile-{case}")
+    hostile_calls = {"eq": 0, "repr": 0, "strip": 0}
+    namespace = object.__getattribute__(request, "__dict__")
+    fields_set = object.__getattribute__(request, "__pydantic_fields_set__")
+    if case == "missing_mode":
+        set.remove(fields_set, "report_mode")
+    elif case == "missing_locale":
+        set.remove(fields_set, "report_locale")
+    elif case == "freeform":
+        dict.__setitem__(namespace, "report_mode", "freeform")
+        dict.__setitem__(namespace, "report_locale", None)
+    elif case == "none_locale":
+        dict.__setitem__(namespace, "report_locale", None)
+    elif case == "unknown":
+        dict.__setitem__(namespace, "report_mode", "unknown")
+    elif case == "case":
+        dict.__setitem__(namespace, "report_locale", "ZH-CN")
+    elif case == "whitespace":
+        dict.__setitem__(namespace, "report_locale", " zh-CN ")
+    else:
+        class StringSubclass(str):
+            def __eq__(self, other: object) -> bool:
+                hostile_calls["eq"] += 1
+                raise AssertionError("string subclass equality executed")
+
+            def __repr__(self) -> str:
+                hostile_calls["repr"] += 1
+                raise AssertionError("string subclass repr executed")
+
+            def strip(self, *args: object, **kwargs: object) -> str:
+                hostile_calls["strip"] += 1
+                raise AssertionError("string subclass strip executed")
+
+        dict.__setitem__(namespace, "report_locale", StringSubclass("zh-CN"))
+    with pytest.raises(InvariantError, match="academic workflow invariant violation"):
+        await start_academic_workflow(request, adapter, checkpointer=saver)
+    assert adapter.calls == []
+    assert hostile_calls == {"eq": 0, "repr": 0, "strip": 0}

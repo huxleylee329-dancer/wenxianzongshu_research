@@ -14,6 +14,7 @@ from langgraph.types import Command, Interrupt, PregelTask, StateSnapshot
 
 from gpt_researcher.workflows.academic_writing import graph as graph_module
 from gpt_researcher.workflows.academic_writing import nodes as nodes_module
+from gpt_researcher.workflows.academic_writing import report_profiles as profiles_module
 from gpt_researcher.workflows.academic_writing import state as state_module
 from gpt_researcher.workflows.academic_writing.adapters import AcademicWritingAdapter
 from gpt_researcher.workflows.academic_writing.state import (
@@ -26,6 +27,38 @@ from gpt_researcher.workflows.academic_writing.state import (
     WorkflowResearchEvidence,
     WorkflowTopicPlan,
 )
+
+
+_FIXED_MODE = "stem_literature_review"
+_FIXED_LOCALE = "zh-CN"
+_FIXED_PROFILE = profiles_module._get_report_profile(_FIXED_MODE)
+
+
+def _fixed_outline(
+    *,
+    evidence_id: str = "evidence:000001",
+    title: str = "Root topic",
+) -> WorkflowOutline:
+    if _FIXED_PROFILE is None:  # pragma: no cover - frozen catalog guard
+        raise AssertionError("fixed profile missing")
+    return WorkflowOutline(
+        outline_id="outline:000001",
+        evidence_id=evidence_id,
+        attempt=1,
+        title=title,
+        sections=tuple(
+            WorkflowOutlineSection(
+                section_id=f"section:{order:06d}",
+                order=order,
+                title=section_title,
+                brief="Scope",
+                section_role=section_role,
+            )
+            for order, (section_role, section_title) in enumerate(_FIXED_PROFILE, 1)
+        ),
+        report_mode=_FIXED_MODE,
+        report_locale=_FIXED_LOCALE,
+    )
 
 
 _COMMAND_FIELDS = (
@@ -47,9 +80,7 @@ _INTERRUPT_KEYS = (
     "thread_id",
     "workflow_id",
 )
-_DEFAULT_OUTLINE_DIGEST = (
-    "c0e475789ade2de190f86f7a93d9560b71d090fc80cef53509612e5f6c7ab280"
-)
+_DEFAULT_OUTLINE_DIGEST = state_module._outline_digest(_fixed_outline())
 _DEFAULT_INTERRUPT_PAYLOAD = {
     "allowed_decisions": ["approve", "reject"],
     "outline_digest": _DEFAULT_OUTLINE_DIGEST,
@@ -112,6 +143,8 @@ def _request() -> AcademicWorkflowRequest:
         document_urls=(),
         query_domains=(),
         max_search_results=None,
+        report_mode=_FIXED_MODE,
+        report_locale=_FIXED_LOCALE,
     )
 
 
@@ -135,7 +168,7 @@ def _command(
         thread_id="thread-1",
         run_id="run-1",
         outline_id="outline:000001",
-        outline_digest=_DEFAULT_OUTLINE_DIGEST,
+        outline_digest=state_module._outline_digest(outline),
         decision=decision,
         actor_assertion=actor,
     )
@@ -189,20 +222,7 @@ class _Adapter(AcademicWritingAdapter):
         evidence: WorkflowResearchEvidence,
     ) -> WorkflowOutline | AdapterFailure:
         self.outline_calls += 1
-        return WorkflowOutline(
-            outline_id="outline:000001",
-            evidence_id=evidence.evidence_id,
-            attempt=1,
-            title=request.query,
-            sections=(
-                WorkflowOutlineSection(
-                    section_id="section:000001",
-                    order=1,
-                    title="Introduction",
-                    brief="Scope",
-                ),
-            ),
-        )
+        return _fixed_outline(evidence_id=evidence.evidence_id, title=request.query)
 
 
 def test_command_has_exact_eight_field_resume_mapping_and_strict_bounds() -> None:
@@ -234,20 +254,7 @@ def test_command_has_exact_eight_field_resume_mapping_and_strict_bounds() -> Non
 class _AdapterOutline:
     @staticmethod
     def make() -> WorkflowOutline:
-        return WorkflowOutline(
-            outline_id="outline:000001",
-            evidence_id="evidence:000001",
-            attempt=1,
-            title="Root topic",
-            sections=(
-                WorkflowOutlineSection(
-                    section_id="section:000001",
-                    order=1,
-                    title="Introduction",
-                    brief="Scope",
-                ),
-            ),
-        )
+        return _fixed_outline()
 
 
 def test_interrupt_payload_is_an_independent_exact_seven_key_mapping() -> None:
@@ -706,6 +713,33 @@ def test_identity_actor_and_old_state_boundaries_are_closed() -> None:
             }
         )
     paused = _pause_state()
+    legacy_payload = paused.model_dump(mode="json")
+    legacy_payload["request"].pop("report_mode")
+    legacy_payload["request"].pop("report_locale")
+    legacy_payload["outline"].pop("report_mode")
+    legacy_payload["outline"].pop("report_locale")
+    for section in legacy_payload["outline"]["sections"]:
+        section.pop("section_role")
+    restored_legacy = state_module.restore_workflow_state(
+        {"workflow": legacy_payload}
+    )
+    assert restored_legacy.request.report_mode == "freeform"
+    assert restored_legacy.request.report_locale is None
+    assert restored_legacy.outline.report_mode == "freeform"
+    assert restored_legacy.outline.report_locale is None
+    assert all(
+        section.section_role == "freeform"
+        for section in restored_legacy.outline.sections
+    )
+    canonical_legacy = restored_legacy.model_dump(mode="json")
+    assert canonical_legacy["request"]["report_mode"] == "freeform"
+    assert canonical_legacy["request"]["report_locale"] is None
+    assert canonical_legacy["outline"]["report_mode"] == "freeform"
+    assert canonical_legacy["outline"]["report_locale"] is None
+    assert all(
+        section["section_role"] == "freeform"
+        for section in canonical_legacy["outline"]["sections"]
+    )
     with pytest.raises(Exception):
         state_module.AcademicWorkflowState.model_validate(
             {**paused.model_dump(mode="python"), "status": "completed"}
@@ -1762,6 +1796,15 @@ def _assert_snapshot_oracle(
     assert type(snapshot) is StateSnapshot
     assert type(snapshot.values) is dict
     assert snapshot.values == {"workflow": state.model_dump(mode="json")}
+    workflow = snapshot.values["workflow"]
+    assert workflow["request"]["report_mode"] == _FIXED_MODE
+    assert workflow["request"]["report_locale"] == _FIXED_LOCALE
+    assert workflow["outline"]["report_mode"] == _FIXED_MODE
+    assert workflow["outline"]["report_locale"] == _FIXED_LOCALE
+    assert tuple(
+        (section["section_role"], section["title"])
+        for section in workflow["outline"]["sections"]
+    ) == _FIXED_PROFILE
     assert snapshot.created_at is not None and type(snapshot.created_at) is str
     assert snapshot.metadata == {
         "source": "loop",

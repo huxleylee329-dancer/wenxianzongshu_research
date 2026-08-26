@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import builtins
 import dis
-import hashlib
 import inspect
 import json
 import sys
@@ -15,6 +14,7 @@ import pytest
 from pydantic import ValidationError
 
 from gpt_researcher.workflows.academic_writing import citation_reviewer as module
+from gpt_researcher.workflows.academic_writing import graph as graph_module
 from gpt_researcher.workflows.academic_writing.citation_evidence_gate import (
     WorkflowCitationEvidenceGateResult,
     gate_citation_evidence,
@@ -143,13 +143,6 @@ def _state(
         title="Approved outline",
         sections=tuple(_section(order) for order in range(1, section_count + 1)),
     )
-    encoded = json.dumps(
-        outline.model_dump(mode="json"),
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
     decision = "approve" if approved else "reject"
     record = WorkflowOutlineDecisionRecord(
         decision_id="outline-decision:000001",
@@ -158,7 +151,7 @@ def _state(
         thread_id="thread-1",
         run_id="run-1",
         outline_id="outline:000001",
-        outline_digest=hashlib.sha256(encoded).hexdigest(),
+        outline_digest=graph_module._outline_digest(outline),
         decision=decision,
         actor_assertion="actor-A",
         attempt=1,

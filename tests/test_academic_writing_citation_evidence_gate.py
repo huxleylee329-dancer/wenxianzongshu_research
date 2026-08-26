@@ -27,6 +27,10 @@ from gpt_researcher.workflows.academic_writing.state import (
     WorkflowResearchEvidence,
     WorkflowSectionDraft,
     WorkflowTopicPlan,
+    _outline_digest,
+)
+from gpt_researcher.workflows.academic_writing.report_profiles import (
+    _get_report_profile,
 )
 
 
@@ -154,7 +158,7 @@ def _approved_state(
         thread_id="thread-1",
         run_id="run-1",
         outline_id="outline:000001",
-        outline_digest=hashlib.sha256(outline_bytes).hexdigest(),
+        outline_digest=_outline_digest(outline),
         decision=decision,
         actor_assertion="actor-A",
         attempt=1,
@@ -634,3 +638,45 @@ def test_fixed_error_traceback_has_no_sensitive_inputs_or_partial_result() -> No
                 elif type(value) is types.FunctionType and value.__closure__ is not None:
                     pending.extend(cell.cell_contents for cell in value.__closure__)
         traceback = traceback.tb_next
+
+
+def test_fixed_profile_state_is_accepted_without_new_citation_semantics() -> None:
+    state = _approved_state(section_count=8)
+    profile = _get_report_profile("stem_literature_review")
+    assert profile is not None and state.outline is not None
+    request_namespace = object.__getattribute__(state.request, "__dict__")
+    dict.__setitem__(request_namespace, "report_mode", "stem_literature_review")
+    dict.__setitem__(request_namespace, "report_locale", "zh-CN")
+    request_fields = object.__getattribute__(state.request, "__pydantic_fields_set__")
+    set.add(request_fields, "report_mode")
+    set.add(request_fields, "report_locale")
+    outline_namespace = object.__getattribute__(state.outline, "__dict__")
+    dict.__setitem__(outline_namespace, "report_mode", "stem_literature_review")
+    dict.__setitem__(outline_namespace, "report_locale", "zh-CN")
+    outline_fields = object.__getattribute__(state.outline, "__pydantic_fields_set__")
+    set.add(outline_fields, "report_mode")
+    set.add(outline_fields, "report_locale")
+    for section, (role, title) in zip(state.outline.sections, profile, strict=True):
+        namespace = object.__getattribute__(section, "__dict__")
+        dict.__setitem__(namespace, "section_role", role)
+        dict.__setitem__(namespace, "title", title)
+        set.add(
+            object.__getattribute__(section, "__pydantic_fields_set__"),
+            "section_role",
+        )
+    assert state.outline_decision is not None
+    dict.__setitem__(
+        object.__getattribute__(state.outline_decision, "__dict__"),
+        "outline_digest",
+        _outline_digest(state.outline),
+    )
+    result = gate_citation_evidence(
+        state,
+        _drafts(8, "Body [[cite:evidence-source:000001]]"),
+    )
+    assert result.section_ids == tuple(
+        f"section:{order:06d}" for order in range(1, 9)
+    )
+    assert result.cited_source_ids_by_section == tuple(
+        ("evidence-source:000001",) for _ in range(8)
+    )

@@ -10,6 +10,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, Interrupt, PregelTask, StateSnapshot
 
 from .adapters import AcademicWritingAdapter
+from .report_profiles import _FIXED_REPORT_MODES
 from .nodes import (
     _OutlineApproveCommitError,
     _OutlineRejectCommitError,
@@ -52,6 +53,31 @@ _DECISION_RETRY = object()
 _DECISION_INVARIANT = object()
 _DECISION_APPROVE_COMMIT = object()
 _DECISION_REJECT_COMMIT = object()
+
+_REQUEST_FIELDS = (
+    "workflow_mode",
+    "workflow_id",
+    "thread_id",
+    "run_id",
+    "query",
+    "report_type",
+    "report_source",
+    "tone",
+    "language",
+    "source_urls",
+    "document_urls",
+    "query_domains",
+    "max_search_results",
+    "report_mode",
+    "report_locale",
+)
+_REQUEST_OLD_FIELDS = frozenset(_REQUEST_FIELDS[:-2])
+_REQUEST_ALLOWED_FIELD_SETS = (
+    frozenset(_REQUEST_FIELDS),
+    _REQUEST_OLD_FIELDS | {"report_mode"},
+    _REQUEST_OLD_FIELDS | {"report_locale"},
+    _REQUEST_OLD_FIELDS,
+)
 
 
 def _build_graph(
@@ -96,6 +122,47 @@ def _safe_input(value: object, expected_type: type):
     if failed or validated is None:
         raise InvariantError()
     return validated
+
+
+def _inspect_start_profile(value: object) -> tuple[bool, bool, str, str | None]:
+    failed = False
+    result: tuple[bool, bool, str, str | None] | None = None
+    try:
+        if type(value) is not AcademicWorkflowRequest:
+            raise TypeError("request type is invalid")
+        namespace = object.__getattribute__(value, "__dict__")
+        fields_set = object.__getattribute__(value, "__pydantic_fields_set__")
+        extra = object.__getattribute__(value, "__pydantic_extra__")
+        private = object.__getattribute__(value, "__pydantic_private__")
+        if type(namespace) is not dict or type(fields_set) is not set:
+            raise TypeError("request surface is invalid")
+        if extra is not None or private is not None:
+            raise TypeError("request state is invalid")
+        keys = tuple(dict.keys(namespace))
+        members = tuple(set.__iter__(fields_set))
+        if any(type(key) is not str for key in keys) or any(
+            type(member) is not str for member in members
+        ):
+            raise TypeError("request field names are invalid")
+        if frozenset(keys) != frozenset(_REQUEST_FIELDS) or not any(
+            fields_set == allowed for allowed in _REQUEST_ALLOWED_FIELD_SETS
+        ):
+            raise TypeError("request fields are invalid")
+        mode = dict.__getitem__(namespace, "report_mode")
+        locale = dict.__getitem__(namespace, "report_locale")
+        if type(mode) is not str or (locale is not None and type(locale) is not str):
+            raise TypeError("request profile values are invalid")
+        result = (
+            "report_mode" in fields_set,
+            "report_locale" in fields_set,
+            mode,
+            locale,
+        )
+    except Exception:
+        failed = True
+    if failed or result is None:
+        raise InvariantError() from None
+    return result
 
 
 def _safe_restore(graph_state: object) -> AcademicWorkflowState:
@@ -257,6 +324,9 @@ async def start_academic_workflow(
 ) -> AcademicWorkflowState:
     """Start a new guarded workflow thread."""
 
+    mode_explicit, locale_explicit, selected_mode, selected_locale = (
+        _inspect_start_profile(request)
+    )
     validated_request = _safe_input(request, AcademicWorkflowRequest)
     identity = AcademicWorkflowIdentity(
         workflow_id=validated_request.workflow_id,
@@ -269,6 +339,13 @@ async def start_academic_workflow(
     }
     snapshot = await graph.aget_state(config)
     if snapshot.created_at is None:
+        if (
+            not mode_explicit
+            or not locale_explicit
+            or selected_mode not in _FIXED_REPORT_MODES
+            or selected_locale != "zh-CN"
+        ):
+            raise InvariantError() from None
         initial_state = AcademicWorkflowState(
             schema_version="1",
             workflow_id=identity.workflow_id,

@@ -100,8 +100,11 @@ _EVIDENCE_FIELDS = (
 )
 _SOURCE_FIELDS = ("source_id", "order", "title", "url", "candidate_id")
 _PROVENANCE_FIELDS = ("source_id", "evidence_blocks")
-_OUTLINE_FIELDS = ("outline_id", "evidence_id", "attempt", "title", "sections")
-_SECTION_FIELDS = ("section_id", "order", "title", "brief")
+_OUTLINE_FIELDS = (
+    "outline_id", "evidence_id", "attempt", "title", "sections",
+    "report_mode", "report_locale",
+)
+_SECTION_FIELDS = ("section_id", "order", "title", "brief", "section_role")
 _DECISION_FIELDS = (
     "decision_id",
     "schema_version",
@@ -746,7 +749,19 @@ def _state_projection(
         _EVIDENCE_FIELDS,
         (full, missing_provenance),
     )
-    outline_surface = _surface(outline_value, _WorkflowOutline, _OUTLINE_FIELDS)
+    outline_full = frozenset(_OUTLINE_FIELDS)
+    outline_old = frozenset(_OUTLINE_FIELDS[:-2])
+    outline_surface = _surface(
+        outline_value,
+        _WorkflowOutline,
+        _OUTLINE_FIELDS,
+        (
+            outline_full,
+            outline_old | {"report_mode"},
+            outline_old | {"report_locale"},
+            outline_old,
+        ),
+    )
     decision_surface = _surface(
         decision_value,
         _WorkflowOutlineDecisionRecord,
@@ -769,6 +784,8 @@ def _state_projection(
     outline_evidence_id = dict.__getitem__(outline_namespace, "evidence_id")
     outline_attempt = dict.__getitem__(outline_namespace, "attempt")
     sections = dict.__getitem__(outline_namespace, "sections")
+    report_mode = dict.__getitem__(outline_namespace, "report_mode")
+    report_locale = dict.__getitem__(outline_namespace, "report_locale")
     decision_outline = dict.__getitem__(decision_namespace, "outline_id")
     decision = dict.__getitem__(decision_namespace, "decision")
     decision_attempt = dict.__getitem__(decision_namespace, "attempt")
@@ -784,6 +801,8 @@ def _state_projection(
         or type(outline_attempt) is not int
         or outline_attempt != 1
         or type(sections) is not tuple
+        or type(report_mode) is not str
+        or (report_locale is not None and type(report_locale) is not str)
         or not 1 <= tuple.__len__(sections) <= 12
         or type(decision_outline) is not str
         or decision_outline != outline_id
@@ -799,7 +818,13 @@ def _state_projection(
     section_index = 0
     while section_index < tuple.__len__(sections):
         section = tuple.__getitem__(sections, section_index)
-        section_surface = _surface(section, _WorkflowOutlineSection, _SECTION_FIELDS)
+        section_full = frozenset(_SECTION_FIELDS)
+        section_surface = _surface(
+            section,
+            _WorkflowOutlineSection,
+            _SECTION_FIELDS,
+            (section_full, frozenset(_SECTION_FIELDS[:-1])),
+        )
         if type(section_surface) is not tuple:
             section_ids.clear()
             return _FAILURE
@@ -808,6 +833,7 @@ def _state_projection(
         order = dict.__getitem__(section_namespace, "order")
         title = dict.__getitem__(section_namespace, "title")
         brief = dict.__getitem__(section_namespace, "brief")
+        section_role = dict.__getitem__(section_namespace, "section_role")
         if (
             type(section_id) is not str
             or type(order) is not int
@@ -817,6 +843,7 @@ def _state_projection(
             or not title.strip()
             or type(brief) is not str
             or not brief.strip()
+            or type(section_role) is not str
         ):
             section_ids.clear()
             return _FAILURE

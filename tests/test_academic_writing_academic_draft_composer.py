@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import types
 
@@ -13,6 +12,7 @@ from pydantic import ValidationError
 from gpt_researcher.workflows.academic_writing import (
     academic_draft_composer as module,
 )
+from gpt_researcher.workflows.academic_writing import graph as graph_module
 from gpt_researcher.workflows.academic_writing.academic_draft_composer import (
     GPTResearcherAcademicDraftComposer,
     WorkflowAcademicDraftComposition,
@@ -166,13 +166,6 @@ def _approved_state(
         title="O",
         sections=sections,
     )
-    outline_bytes = json.dumps(
-        outline.model_dump(mode="json"),
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
     decision = WorkflowOutlineDecisionRecord(
         decision_id="outline-decision:000001",
         schema_version="1",
@@ -180,7 +173,7 @@ def _approved_state(
         thread_id="thread-1",
         run_id="run-1",
         outline_id="outline:000001",
-        outline_digest=hashlib.sha256(outline_bytes).hexdigest(),
+        outline_digest=graph_module._outline_digest(outline),
         decision="approve",
         actor_assertion="actor-A",
         attempt=1,

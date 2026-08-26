@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 from datetime import datetime
@@ -32,6 +33,21 @@ from gpt_researcher.workflows.academic_writing.state import (
     restore_workflow_state,
     validate_json_value,
     workflow_to_graph_state,
+    _canonical_outline_bytes,
+    _outline_digest,
+)
+from gpt_researcher.workflows.academic_writing.report_profiles import (
+    _get_report_profile,
+)
+
+
+_PROFILE_GOLDENS = (
+    ("stem_literature_review", (("research_background", "研究背景"), ("literature_search_method", "文献检索方法"), ("technical_routes", "主要技术路线"), ("experimental_methods_and_metrics", "实验方法与评价指标"), ("results_comparison", "研究结果对比"), ("existing_problems", "现有问题"), ("future_research", "未来研究方向"), ("conclusion", "结论"))),
+    ("technical_route_survey", (("requirements_and_scope", "需求与边界"), ("literature_search_method", "资料检索方法"), ("technical_routes", "技术路线分类"), ("principles_and_process", "核心原理与流程"), ("performance_maturity_cost_comparison", "性能成熟度与成本对比"), ("application_scenarios", "适用场景"), ("risks_and_challenges", "风险与难点"), ("recommended_route", "推荐路线"), ("conclusion", "结论"))),
+    ("method_comparison", (("problem_definition", "问题定义"), ("comparison_framework", "比较框架"), ("candidate_methods", "候选方法"), ("experimental_conditions_and_data", "实验条件与数据"), ("performance_comparison", "性能对比"), ("robustness_and_scalability", "鲁棒性与扩展性"), ("cost_and_engineering_complexity", "成本与工程复杂度"), ("selection_guidance", "适用条件与选型建议"), ("conclusion", "结论"))),
+    ("equipment_material_selection", (("requirements_and_constraints", "需求与约束"), ("candidate_options", "候选方案"), ("parameters_and_material_properties", "关键参数与材料性能"), ("testing_and_evidence", "测试与证据"), ("compatibility_and_reliability", "兼容性与可靠性"), ("cost_and_supply_risk", "成本与供应风险"), ("safety_environment_compliance", "安全环保与合规"), ("decision_matrix", "决策矩阵"), ("recommended_solution", "推荐方案"), ("conclusion", "结论"))),
+    ("proposal_research_status", (("research_background_and_significance", "研究背景与意义"), ("literature_search_method", "检索范围与方法"), ("domestic_research_status", "国内研究现状"), ("international_research_status", "国外研究现状"), ("technical_routes", "主要学派或技术路线"), ("existing_problems", "现有不足"), ("proposed_problem", "拟解决问题"), ("research_content_and_innovation", "研究内容与创新点"), ("conclusion", "结论"))),
+    ("systematic_literature_review", (("research_questions_and_protocol", "研究问题与协议"), ("databases_and_search_strategy", "数据库与检索式"), ("eligibility_criteria", "纳入排除标准"), ("quality_assessment", "质量评价"), ("study_selection_process", "文献筛选流程"), ("data_extraction_and_synthesis", "数据提取与综合"), ("results", "结果"), ("bias_and_limitations", "偏倚与局限"), ("discussion", "讨论"), ("conclusion", "结论"))),
 )
 
 
@@ -964,3 +980,149 @@ def test_section_draft_rejects_mapping_and_string_subclasses_and_json_attempts()
         changed = dict(valid, attempt=attempt)
         with pytest.raises((TypeError, ValidationError)):
             WorkflowSectionDraft.model_validate_json(json.dumps(changed))
+
+
+@pytest.mark.parametrize(("mode", "expected"), _PROFILE_GOLDENS)
+def test_fixed_report_profile_catalog_and_outline_binding(
+    mode: str, expected: tuple[tuple[str, str], ...]
+) -> None:
+    assert _get_report_profile(mode) == expected
+    assert 8 <= len(expected) <= 10
+    sections = tuple(
+        WorkflowOutlineSection(
+            section_id=f"section:{order:06d}",
+            order=order,
+            title=title,
+            brief=f"目标{order}",
+            section_role=role,
+        )
+        for order, (role, title) in enumerate(expected, start=1)
+    )
+    outline = WorkflowOutline(
+        outline_id="outline:000001",
+        evidence_id="evidence:000001",
+        attempt=1,
+        title="固定结构",
+        sections=sections,
+        report_mode=mode,
+        report_locale="zh-CN",
+    )
+    assert tuple(
+        (section.section_role, section.title) for section in outline.sections
+    ) == expected
+    assert tuple(section.order for section in outline.sections) == tuple(
+        range(1, len(expected) + 1)
+    )
+    assert all(section.section_role != "freeform" for section in outline.sections)
+
+
+def test_report_profile_legacy_4_4_2_shapes_and_one_way_dump() -> None:
+    request_payload = _request().model_dump(mode="json")
+    request_full = set(request_payload)
+    for omitted in (
+        (),
+        ("report_mode",),
+        ("report_locale",),
+        ("report_mode", "report_locale"),
+    ):
+        payload = dict(request_payload)
+        for name in omitted:
+            del payload[name]
+        restored = AcademicWorkflowRequest.model_validate_json(json.dumps(payload))
+        assert restored.report_mode == "freeform"
+        assert restored.report_locale is None
+        assert object.__getattribute__(restored, "__pydantic_fields_set__") == (
+            request_full - set(omitted)
+        )
+        assert {"report_mode", "report_locale"} <= set(
+            restored.model_dump(mode="json")
+        )
+
+    outline_payload = _outline().model_dump(mode="json")
+    outline_full = set(outline_payload)
+    for omitted in (
+        (),
+        ("report_mode",),
+        ("report_locale",),
+        ("report_mode", "report_locale"),
+    ):
+        payload = dict(outline_payload)
+        for name in omitted:
+            del payload[name]
+        restored = WorkflowOutline.model_validate_json(json.dumps(payload))
+        assert restored.report_mode == "freeform" and restored.report_locale is None
+        assert object.__getattribute__(restored, "__pydantic_fields_set__") == (
+            outline_full - set(omitted)
+        )
+
+    section_payload = _section().model_dump(mode="json")
+    section_full = set(section_payload)
+    for omitted in ((), ("section_role",)):
+        payload = dict(section_payload)
+        for name in omitted:
+            del payload[name]
+        restored = WorkflowOutlineSection.model_validate_json(json.dumps(payload))
+        assert restored.section_role == "freeform"
+        assert object.__getattribute__(restored, "__pydantic_fields_set__") == (
+            section_full - set(omitted)
+        )
+
+    for payload in (
+        {key: value for key, value in request_payload.items() if key != "query"},
+        dict(request_payload, extra="x"),
+    ):
+        with pytest.raises((TypeError, ValidationError)):
+            AcademicWorkflowRequest.model_validate_json(json.dumps(payload))
+
+
+def test_fixed_digest_complete_stem_golden_and_legacy_domain() -> None:
+    profile = _get_report_profile("stem_literature_review")
+    assert profile is not None
+    fixed = WorkflowOutline(
+        outline_id="outline:000001",
+        evidence_id="evidence:000001",
+        attempt=1,
+        title="示例综述",
+        sections=tuple(
+            WorkflowOutlineSection(
+                section_id=f"section:{order:06d}",
+                order=order,
+                title=title,
+                brief=f"目标{order}",
+                section_role=role,
+            )
+            for order, (role, title) in enumerate(profile, start=1)
+        ),
+        report_mode="stem_literature_review",
+        report_locale="zh-CN",
+    )
+    assert len(_canonical_outline_bytes(fixed)) == 1166
+    assert _outline_digest(fixed) == (
+        "a1f9d02e75f912abfb458c82b0f27f3ead7d9d8ad7d23e32d91b28c43adbbd1b"
+    )
+    legacy = _outline()
+    legacy_payload = {
+        "outline_id": legacy.outline_id,
+        "evidence_id": legacy.evidence_id,
+        "attempt": legacy.attempt,
+        "title": legacy.title,
+        "sections": [
+            {
+                "section_id": section.section_id,
+                "order": section.order,
+                "title": section.title,
+                "brief": section.brief,
+            }
+            for section in legacy.sections
+        ],
+    }
+    expected = hashlib.sha256(
+        json.dumps(
+            legacy_payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert _outline_digest(legacy) == expected
