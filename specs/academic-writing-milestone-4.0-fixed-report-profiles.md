@@ -2,7 +2,7 @@
 
 Status: **Approved and frozen**
 
-规范已批准并冻结，仅授权在精确十九文件边界内继续实施；Implementation acceptance在实施完成并验证前保持未勾选。
+规范已批准并冻结，仅授权精确21文件边界内继续实施；Implementation acceptance在实施完成并验证前保持未勾选。
 
 ## 1. Goal and terminal planning boundary
 
@@ -50,11 +50,11 @@ semantics.
 
 ## 3. Exact future implementation boundary
 
-Implementation may touch exactly these nineteen files after renewed explicit
+Implementation may touch exactly these twenty-one files after renewed explicit
 approval. The production boundary remains the original seven files: one added
-module and six modified modules. The test boundary expands from six to twelve
-files. The existing thirteen-file partial implementation is retained as a
-read-only recovery point until renewed approval.
+module and six modified modules. The test boundary expands from twelve to
+fourteen files. The existing nineteen-file partial implementation is retained
+as a read-only recovery point until renewed approval.
 
 Add:
 
@@ -88,9 +88,11 @@ tests/test_academic_writing_outline_approval.py
 tests/test_academic_writing_section_writer_sequence.py
 tests/test_academic_writing_section_writer.py
 tests/test_academic_writing_section_merger.py
+tests/test_academic_writing_research_evidence.py
+tests/test_academic_writing_topic_planner.py
 ```
 
-No twentieth file is permitted. No additional production file is permitted.
+No twenty-second file is permitted. No additional production file is permitted.
 In particular, implementation must not modify TopicPlanner, ResearchEvidence,
 CitationReviewer, CitationReviewDisposition, or AcademicDraftComposer production
 code, package initializers, dependencies, graph nodes, adapters, events, or any
@@ -683,12 +685,26 @@ Permanent tests are limited to behavior and real regression risks:
    `_outline_digest` contract or the same already-exposed production test entry.
    They must not hash a complete `outline.model_dump()`, copy either canonical
    projection, call SHA directly, or change the tested production behavior; and
-9. `test_academic_writing_outline_approval.py` updates its nineteen existing
-   new-start call groups through the smallest shared parameterization so each
-   start supplies one explicit fixed mode, exact `zh-CN`, and a catalog-conformant
-   outline. Its checkpoint assertions include the real canonical 4.0 default
-   fields, while its legacy-resume coverage continues to omit and restore
-   `freeform`/`None`/`freeform` without confusing resume with new start.
+9. the existing new-start fixtures in
+   `test_academic_writing_outline_approval.py`,
+   `test_academic_writing_research_evidence.py`, and
+   `test_academic_writing_topic_planner.py` use the smallest shared fixture
+   change so every new thread supplies one explicit fixed mode, exact `zh-CN`,
+   and an outline whose mode, locale, role, title, and order match the real
+   catalog. Their approval digest uses the sole production `_outline_digest`
+   contract. Outline-approval checkpoint assertions include the real canonical
+   4.0 default fields. Any existing legacy-resume vector continues to omit and
+   restore `freeform`/`None`/`freeform` without confusing resume with new start.
+   In the two newly authorized tests, no ResearchEvidence or TopicPlanner
+   adapter behavior, prompt, output, call count, safety guard, or existing
+   boundary may change.
+
+The paused regression recovery fact is exact: the academic-writing run
+collected 1,024 tests and executed a prefix of 915; 900 passed, 15 failed, and
+zero errored. Fourteen failures came from
+`test_academic_writing_research_evidence.py` and one from
+`test_academic_writing_topic_planner.py`. The unexecuted tail is neither passed
+nor failed, and this prefix supplies no evidence of a production defect.
 
 Tests use injected fake clients and existing fixtures. They perform no real
 Config, LLM, Provider, Retriever, network, filesystem, backend, frontend, or
@@ -723,7 +739,7 @@ Implementation stops and requires a new explicitly approved specification if:
   for an unexplained reason;
 - the exact 65,536 and 65,537 vectors do not both pass every earlier field,
   item, count, and aggregate condition stated here;
-- any twentieth file is required;
+- any twenty-second file is required;
 - TopicPlanner, ResearchEvidence, CitationReviewer,
   CitationReviewDisposition, or AcademicDraftComposer production code must
   change;
@@ -775,14 +791,14 @@ Implementation stops and requires a new explicitly approved specification if:
 - [ ] Locale, mode, ordered roles, and catalog titles participate in fixed digest binding.
 - [ ] The complete stem canonical JSON, 1,166 bytes, and full digest are approved.
 - [ ] Supersession is limited to the exact 3.0, 3.3, 3.4, and legacy-canonical clauses.
-- [ ] The exact nineteen-file implementation boundary is approved.
-- [ ] No twentieth file, additional production file, dependency, initializer, frozen-spec, or unrelated test may change.
+- [ ] The exact twenty-one-file implementation boundary is approved.
+- [ ] No twenty-second file, additional production file, dependency, initializer, frozen-spec, or unrelated test may change.
 - [ ] The focused parameter matrices and explicit test exclusions are approved.
 - [ ] All listed non-goals and stop conditions are approved.
 
 ## 17. Implementation acceptance
 
-- [ ] Only the nineteen approved files changed, with exactly one new production module and no additional production file.
+- [ ] Only the twenty-one approved files changed, with exactly one new production module and no additional production file.
 - [ ] `ReportMode` accepts only the seven exact literals and rejects subclasses/coercions.
 - [ ] Request, outline, and section accept exactly the frozen 4/4/2 fields-set shapes and restore omitted values exactly.
 - [ ] Explicit null mode, wrong locale, wrong type, unknown value, and corrupt shapes reject.
@@ -817,7 +833,7 @@ Implementation stops and requires a new explicitly approved specification if:
 - [ ] The corresponding 24,577 raw response rejects without repair.
 - [ ] Freeform digest bytes and hex remain identical for old approved checkpoints.
 - [ ] All six scope-expansion test files use the sole `_outline_digest` contract for old digest fixtures; no complete `outline.model_dump()` digest, copied projection, or direct SHA remains.
-- [ ] Outline-approval new-start tests explicitly use a fixed mode plus exact `zh-CN` and assert the canonical 4.0 checkpoint shape, while missing-field legacy resume remains compatible.
+- [ ] Outline-approval, ResearchEvidence, TopicPlanner, and every in-boundary new-thread fixture calling `start_academic_workflow` explicitly use a fixed mode plus exact `zh-CN`; the canonical 4.0 checkpoint shape is asserted and missing-field legacy resume remains compatible.
 - [ ] Fixed digest uses `academic-fixed-profile-v1` followed by one NUL domain separator through `_outline_digest` only.
 - [ ] The complete stem golden produces exactly 1,166 canonical UTF-8 bytes.
 - [ ] The complete stem digest equals `a1f9d02e75f912abfb458c82b0f27f3ead7d9d8ad7d23e32d91b28c43adbbd1b`.
