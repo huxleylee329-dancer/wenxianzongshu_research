@@ -5,13 +5,17 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
-from typing import TypeVar
+from typing import Protocol, TypeVar
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 from pydantic import BaseModel
 
 from .adapters import AcademicWritingAdapter
+from .academic_draft_composer import (
+    GPTResearcherAcademicDraftComposer,
+    WorkflowAcademicDraftComposition,
+)
 from .state import (
     AcademicWorkflowGraphState,
     AcademicOutlineDecisionCommand,
@@ -32,6 +36,13 @@ from .state import (
     validate_json_value,
     workflow_to_graph_state,
 )
+from .workflow_outcome import (
+    AcademicWorkflowPersistentState,
+    WorkflowDraftReadyOutcome,
+    WorkflowReviewRequiredOutcome,
+    _persistent_workflow_to_graph_state,
+    _restore_persistent_workflow_state,
+)
 
 
 _Dto = TypeVar("_Dto", bound=BaseModel)
@@ -44,6 +55,44 @@ _EXECUTION_FAILURE = object()
 _INVARIANT_FAILURE = object()
 _APPROVE_COMMIT_FAILURE = object()
 _REJECT_COMMIT_FAILURE = object()
+_PRODUCTION_COMPOSER = object()
+_EMPTY_SLOT = object()
+
+
+class _AcademicDraftComposer(Protocol):
+    async def compose(
+        self,
+        state: AcademicWorkflowState,
+    ) -> WorkflowAcademicDraftComposition: ...
+
+
+class _ComposerDependencySlot:
+    __slots__ = ("_value", "_consumed")
+
+    def __init__(self, value: object) -> None:
+        self._value = value
+        self._consumed = False
+
+    def consume(self) -> object:
+        if self._consumed or self._value is _EMPTY_SLOT:
+            raise InvariantError() from None
+        value = self._value
+        self._value = _EMPTY_SLOT
+        self._consumed = True
+        return value
+
+    def clear(self) -> None:
+        self._value = _EMPTY_SLOT
+
+    def is_empty(self) -> bool:
+        return self._value is _EMPTY_SLOT
+
+
+def _composer_slot(composer: _AcademicDraftComposer | None) -> _ComposerDependencySlot:
+    choice = _PRODUCTION_COMPOSER if composer is None else composer
+    slot = _ComposerDependencySlot(choice)
+    del composer, choice
+    return slot
 
 
 class _OutlineApproveCommitError(RuntimeError):
@@ -124,6 +173,24 @@ def _validated_transition(
         failed = True
     if failed or state is None or graph_state is None:
         raise InvariantError()
+    return graph_state
+
+
+def _validated_persistent_transition(
+    state: AcademicWorkflowPersistentState,
+) -> AcademicWorkflowGraphState:
+    failed = False
+    graph_state: AcademicWorkflowGraphState | None = None
+    try:
+        graph_state = _persistent_workflow_to_graph_state(state)
+        restored = _restore_persistent_workflow_state(graph_state)
+        graph_state = _persistent_workflow_to_graph_state(restored)
+        del restored
+    except Exception:
+        failed = True
+    del state
+    if failed or graph_state is None:
+        raise InvariantError() from None
     return graph_state
 
 
@@ -402,7 +469,7 @@ def _restore_approval_command(
 def _build_approval_terminal_state(
     state: AcademicWorkflowState,
     command: AcademicOutlineDecisionCommand,
-) -> AcademicWorkflowState:
+) -> AcademicWorkflowPersistentState:
     if state.outline is None:
         raise ValueError("approval predecessor has no outline")
     record = WorkflowOutlineDecisionRecord(
@@ -421,28 +488,34 @@ def _build_approval_terminal_state(
     completed = _event(
         state.events + (started,), "node_completed", "outline_approval"
     )
-    terminal_type = (
-        "workflow_completed" if command.decision == "approve" else "workflow_rejected"
+    approve = command.decision == "approve"
+    terminal = (
+        None
+        if approve
+        else _event(
+            state.events + (started, completed), "workflow_rejected", None
+        )
     )
-    terminal = _event(state.events + (started, completed), terminal_type, None)
-    return AcademicWorkflowState(
+    events = (
+        state.events + (started, completed)
+        if terminal is None
+        else state.events + (started, completed, terminal)
+    )
+    return AcademicWorkflowPersistentState(
         schema_version="1",
         workflow_id=state.workflow_id,
         thread_id=state.thread_id,
         run_id=state.run_id,
-        phase=(
-            "outline_approved"
-            if command.decision == "approve"
-            else "outline_rejected"
-        ),
-        status="completed",
+        phase="outline_approved" if approve else "outline_rejected",
+        status="running" if approve else "completed",
         request=state.request,
         topic_plan=state.topic_plan,
         research_evidence=state.research_evidence,
         outline=state.outline,
         outline_decision=record,
         errors=(),
-        events=state.events + (started, completed, terminal),
+        events=events,
+        outcome=None,
     )
 
 
@@ -456,8 +529,8 @@ def _prepare_approval_transition(
         return _INVARIANT_FAILURE
 
     try:
-        return _validated_transition(
-            lambda: _build_approval_terminal_state(state, command)
+        return _validated_persistent_transition(
+            _build_approval_terminal_state(state, command)
         )
     except asyncio.CancelledError:
         raise
@@ -505,12 +578,232 @@ def _make_outline_approval_node() -> _Node:
     return _outline_approval
 
 
-def _make_nodes(adapter: AcademicWritingAdapter) -> tuple[_Node, _Node, _Node, _Node]:
+def _execution_view(state: AcademicWorkflowPersistentState) -> AcademicWorkflowState:
+    terminal = _event(state.events, "workflow_completed", None)
+    return AcademicWorkflowState(
+        schema_version="1",
+        workflow_id=state.workflow_id,
+        thread_id=state.thread_id,
+        run_id=state.run_id,
+        phase="outline_approved",
+        status="completed",
+        request=state.request,
+        topic_plan=state.topic_plan,
+        research_evidence=state.research_evidence,
+        outline=state.outline,
+        outline_decision=state.outline_decision,
+        errors=(),
+        events=state.events + (terminal,),
+    )
+
+
+def _trusted_composition(value: object) -> WorkflowAcademicDraftComposition:
+    if type(value) is not WorkflowAcademicDraftComposition:
+        raise InvariantError() from None
+    try:
+        dumped = BaseModel.model_dump(value, mode="json")
+        validate_json_value(dumped)
+        encoded = json.dumps(
+            dumped,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        trusted = WorkflowAcademicDraftComposition.model_validate_json(encoded)
+    except Exception:
+        raise InvariantError() from None
+    if type(trusted) is not WorkflowAcademicDraftComposition:
+        raise InvariantError() from None
+    return trusted
+
+
+def _terminal_state(
+    state: AcademicWorkflowPersistentState,
+    composition: WorkflowAcademicDraftComposition,
+) -> AcademicWorkflowPersistentState:
+    disposition = composition.disposition.disposition
+    if disposition == "ready":
+        referenced = composition.referenced_draft
+        if referenced is None:
+            raise InvariantError() from None
+        outcome = WorkflowDraftReadyOutcome(
+            outcome_type="draft_ready",
+            referenced_draft=referenced,
+        )
+        phase = "draft_ready"
+    elif disposition in ("blocked", "needs_human_review"):
+        outcome = WorkflowReviewRequiredOutcome(
+            outcome_type="review_required",
+            drafts=composition.drafts,
+            gate_result=composition.gate_result,
+            reviews=composition.reviews,
+        )
+        phase = "review_required"
+    else:
+        raise InvariantError() from None
+    started = _event(state.events, "node_started", "academic_draft_composer")
+    completed = _event(
+        state.events + (started,), "node_completed", "academic_draft_composer"
+    )
+    terminal = _event(
+        state.events + (started, completed), "workflow_completed", None
+    )
+    return AcademicWorkflowPersistentState(
+        schema_version="1",
+        workflow_id=state.workflow_id,
+        thread_id=state.thread_id,
+        run_id=state.run_id,
+        phase=phase,
+        status="completed",
+        request=state.request,
+        topic_plan=state.topic_plan,
+        research_evidence=state.research_evidence,
+        outline=state.outline,
+        outline_decision=state.outline_decision,
+        errors=(),
+        events=state.events + (started, completed, terminal),
+        outcome=outcome,
+    )
+
+
+def _make_academic_draft_composer_node(
+    slot: _ComposerDependencySlot,
+) -> _Node:
+    async def _academic_draft_composer(
+        graph_state: AcademicWorkflowGraphState,
+        config: RunnableConfig,
+    ) -> AcademicWorkflowGraphState:
+        state: AcademicWorkflowPersistentState | None = None
+        execution_view: AcademicWorkflowState | None = None
+        composer: object = _EMPTY_SLOT
+        result: object | None = None
+        trusted: WorkflowAcademicDraftComposition | None = None
+        compose_method: object = _EMPTY_SLOT
+        terminal: object = _EMPTY_SLOT
+        transition: object = _EMPTY_SLOT
+        failure: object | None = None
+        try:
+            state = _restore_persistent_workflow_state(graph_state)
+            configurable = config.get("configurable")
+            if type(configurable) is not dict:
+                raise InvariantError() from None
+            thread_id = configurable.get("thread_id")
+            if (
+                type(thread_id) is not str
+                or thread_id != state.thread_id
+                or state.phase != "outline_approved"
+                or state.status != "running"
+                or state.outcome is not None
+            ):
+                raise InvariantError() from None
+            execution_view = _execution_view(state)
+            choice = slot.consume()
+            if choice is _PRODUCTION_COMPOSER:
+                composer = GPTResearcherAcademicDraftComposer()
+            else:
+                composer = choice
+            del choice
+            compose_method = getattr(type(composer), "compose", None)
+            if compose_method is None:
+                compose_method = _EMPTY_SLOT
+                raise InvariantError() from None
+            try:
+                result = await compose_method(composer, execution_view)
+            finally:
+                del compose_method
+                compose_method = _EMPTY_SLOT
+            trusted = _trusted_composition(result)
+            try:
+                terminal = _terminal_state(state, trusted)
+            except Exception:
+                raise InvariantError() from None
+            try:
+                transition = _validated_persistent_transition(terminal)
+            finally:
+                del terminal
+                terminal = _EMPTY_SLOT
+            graph_result = transition
+            transition = _EMPTY_SLOT
+            del (
+                result,
+                trusted,
+                execution_view,
+                composer,
+                state,
+                compose_method,
+                terminal,
+                transition,
+                failure,
+                graph_state,
+                config,
+            )
+            return graph_result
+        except asyncio.CancelledError:
+            slot.clear()
+            del (
+                graph_state,
+                config,
+                state,
+                execution_view,
+                composer,
+                result,
+                trusted,
+                compose_method,
+                terminal,
+                transition,
+                failure,
+            )
+            raise
+        except InvariantError:
+            slot.clear()
+            del (
+                graph_state,
+                config,
+                state,
+                execution_view,
+                composer,
+                result,
+                trusted,
+                compose_method,
+                terminal,
+                transition,
+            )
+            failure = _INVARIANT_FAILURE
+        except Exception:
+            slot.clear()
+            del (
+                graph_state,
+                config,
+                state,
+                execution_view,
+                composer,
+                result,
+                trusted,
+                compose_method,
+                terminal,
+                transition,
+            )
+            failure = _EXECUTION_FAILURE
+        if failure is _INVARIANT_FAILURE:
+            del failure
+            raise InvariantError()
+        del failure
+        raise ExecutionError()
+
+    return _academic_draft_composer
+
+
+def _make_nodes(
+    adapter: AcademicWritingAdapter,
+    composer_slot: _ComposerDependencySlot,
+) -> tuple[_Node, _Node, _Node, _Node, _Node]:
     return (
         _make_topic_planner_node(adapter),
         _make_research_evidence_node(adapter),
         _make_outline_writer_node(adapter),
         _make_outline_approval_node(),
+        _make_academic_draft_composer_node(composer_slot),
     )
 
 
@@ -524,3 +817,23 @@ def _route_after_node(graph_state: AcademicWorkflowGraphState) -> str:
     if failed or state is None:
         raise InvariantError()
     return "end" if state.status == "failed" else "continue"
+
+
+def _route_after_approval(graph_state: AcademicWorkflowGraphState) -> str:
+    try:
+        state = _restore_persistent_workflow_state(graph_state)
+    except Exception:
+        raise InvariantError() from None
+    if (
+        state.phase == "outline_rejected"
+        and state.status == "completed"
+        and state.outcome is None
+    ):
+        return "end"
+    if (
+        state.phase == "outline_approved"
+        and state.status == "running"
+        and state.outcome is None
+    ):
+        return "compose"
+    raise InvariantError() from None

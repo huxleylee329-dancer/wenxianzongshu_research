@@ -17,6 +17,24 @@ from gpt_researcher.workflows.academic_writing import nodes as nodes_module
 from gpt_researcher.workflows.academic_writing import report_profiles as profiles_module
 from gpt_researcher.workflows.academic_writing import state as state_module
 from gpt_researcher.workflows.academic_writing.adapters import AcademicWritingAdapter
+from gpt_researcher.workflows.academic_writing.academic_draft_composer import (
+    WorkflowAcademicDraftComposition,
+)
+from gpt_researcher.workflows.academic_writing.citation_evidence_gate import (
+    WorkflowCitationEvidenceGateResult,
+)
+from gpt_researcher.workflows.academic_writing.citation_review_disposition import (
+    WorkflowCitationReviewDisposition,
+)
+from gpt_researcher.workflows.academic_writing.citation_reviewer import (
+    WorkflowSectionCitationReview,
+)
+from gpt_researcher.workflows.academic_writing.references_renderer import (
+    WorkflowReferencedDraft,
+)
+from gpt_researcher.workflows.academic_writing.section_merger import (
+    WorkflowMergedDraft,
+)
 from gpt_researcher.workflows.academic_writing.state import (
     AcademicWorkflowRequest,
     AcademicWorkflowIdentity,
@@ -25,6 +43,7 @@ from gpt_researcher.workflows.academic_writing.state import (
     WorkflowOutline,
     WorkflowOutlineSection,
     WorkflowResearchEvidence,
+    WorkflowSectionDraft,
     WorkflowTopicPlan,
 )
 
@@ -111,6 +130,8 @@ _PAUSE_EVENTS = (
 _APPROVE_EVENTS = _PAUSE_EVENTS + (
     ("node_started", "outline_approval"),
     ("node_completed", "outline_approval"),
+    ("node_started", "academic_draft_composer"),
+    ("node_completed", "academic_draft_composer"),
     ("workflow_completed", None),
 )
 _REJECT_EVENTS = _PAUSE_EVENTS + (
@@ -225,6 +246,101 @@ class _Adapter(AcademicWritingAdapter):
         return _fixed_outline(evidence_id=evidence.evidence_id, title=request.query)
 
 
+def _composition(verdict: str = "supported") -> WorkflowAcademicDraftComposition:
+    outline = _fixed_outline()
+    section_ids = tuple(section.section_id for section in outline.sections)
+    citations = tuple(("evidence-source:000001",) for _ in section_ids)
+    drafts = tuple(
+        WorkflowSectionDraft(
+            outline_id=outline.outline_id,
+            section_id=section_id,
+            content="Claim [[cite:evidence-source:000001]]",
+            attempt=1,
+        )
+        for section_id in section_ids
+    )
+    gate = WorkflowCitationEvidenceGateResult(
+        outline_id=outline.outline_id,
+        section_ids=section_ids,
+        cited_source_ids_by_section=citations,
+        attempt=1,
+    )
+    if verdict == "supported":
+        routed = "ready"
+        issues: tuple[str, ...] = ()
+    elif verdict == "uncertain":
+        routed = "needs_human_review"
+        issues = ("insufficient_evidence",)
+    else:
+        routed = "blocked"
+        issues = ("possible_contradiction",)
+    reviews = tuple(
+        WorkflowSectionCitationReview(
+            outline_id=outline.outline_id,
+            section_id=section_id,
+            cited_source_ids=cited,
+            verdict=verdict,
+            issues=issues,
+            rationale="Bounded model opinion.",
+            attempt=1,
+        )
+        for section_id, cited in zip(section_ids, citations, strict=True)
+    )
+    disposition = WorkflowCitationReviewDisposition(
+        outline_id=outline.outline_id,
+        section_ids=section_ids,
+        section_dispositions=tuple(routed for _ in section_ids),
+        disposition=routed,
+        attempt=1,
+    )
+    merged = None
+    referenced = None
+    if verdict == "supported":
+        merged = WorkflowMergedDraft(
+            outline_id=outline.outline_id,
+            section_ids=section_ids,
+            content="Merged",
+            attempt=1,
+        )
+        referenced = WorkflowReferencedDraft(
+            outline_id=outline.outline_id,
+            section_ids=section_ids,
+            reference_source_ids=("evidence-source:000001",),
+            content="Merged\n\n## References\n\nopaque",
+            attempt=1,
+        )
+    return WorkflowAcademicDraftComposition(
+        drafts=drafts,
+        gate_result=gate,
+        reviews=reviews,
+        disposition=disposition,
+        merged_draft=merged,
+        referenced_draft=referenced,
+    )
+
+
+class _Composer:
+    def __init__(
+        self,
+        verdict: str = "supported",
+        *,
+        error: BaseException | None = None,
+    ) -> None:
+        self.calls = 0
+        self.verdict = verdict
+        self.error = error
+        self.states: list[object] = []
+
+    async def compose(self, state: object) -> WorkflowAcademicDraftComposition:
+        self.calls += 1
+        self.states.append(state)
+        assert type(state) is state_module.AcademicWorkflowState
+        assert (state.phase, state.status) == ("outline_approved", "completed")
+        if self.error is not None:
+            raise self.error
+        return _composition(self.verdict)
+
+
 def test_command_has_exact_eight_field_resume_mapping_and_strict_bounds() -> None:
     command_type = state_module.AcademicOutlineDecisionCommand
     assert tuple(command_type.model_fields) == _COMMAND_FIELDS
@@ -328,7 +444,9 @@ async def test_normal_pause_has_exact_shape_a_snapshot_and_tuple() -> None:
     state = await graph_module.start_academic_workflow(
         _request(), adapter, checkpointer=saver
     )
-    graph = graph_module._build_graph(adapter, saver)
+    graph = graph_module._build_graph(
+        adapter, saver, nodes_module._composer_slot(_Composer())
+    )
     config = {"configurable": {"thread_id": "thread-1"}}
     snapshot = await graph.aget_state(config)
     checkpoint_tuple = await saver.aget_tuple(config)
@@ -352,26 +470,44 @@ async def test_normal_pause_has_exact_shape_a_snapshot_and_tuple() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("decision", "expected_phase", "expected_events"),
+    ("decision", "verdict", "expected_phase", "expected_events"),
     [
-        ("approve", "outline_approved", _APPROVE_EVENTS),
-        ("reject", "outline_rejected", _REJECT_EVENTS),
+        ("approve", "supported", "draft_ready", _APPROVE_EVENTS),
+        ("approve", "uncertain", "review_required", _APPROVE_EVENTS),
+        ("approve", "unsupported", "review_required", _APPROVE_EVENTS),
+        ("reject", "supported", "outline_rejected", _REJECT_EVENTS),
     ],
 )
 async def test_decision_facade_commits_exact_terminal_golden(
     decision: str,
+    verdict: str,
     expected_phase: str,
     expected_events: tuple[tuple[str, str | None], ...],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     saver = InMemorySaver()
     adapter = _Adapter()
     paused = await graph_module.start_academic_workflow(
         _request(), adapter, checkpointer=saver
     )
+    production_instances: list[_Composer] = []
+
+    def production_composer() -> _Composer:
+        instance = _Composer(verdict)
+        production_instances.append(instance)
+        return instance
+
+    monkeypatch.setattr(
+        nodes_module,
+        "GPTResearcherAcademicDraftComposer",
+        production_composer,
+    )
+    composer = None if decision == "approve" and verdict == "supported" else _Composer(verdict)
     result = await graph_module.submit_academic_outline_decision(
         _command(paused.outline, decision, "actor-A"),
         adapter,
         checkpointer=saver,
+        composer=composer,
     )
     assert (result.phase, result.status) == (expected_phase, "completed")
     assert result.outline_decision is not None
@@ -382,6 +518,43 @@ async def test_decision_facade_commits_exact_terminal_golden(
         {"configurable": {"thread_id": "thread-1"}}
     )
     assert snapshot.next == () and snapshot.tasks == ()
+    workflow = snapshot.values["workflow"]
+    outcome = workflow["outcome"]
+    if decision == "reject":
+        assert outcome is None
+        assert composer.calls == 0
+        assert production_instances == []
+    elif expected_phase == "draft_ready":
+        assert tuple(outcome) == ("outcome_type", "referenced_draft")
+        assert outcome["outcome_type"] == "draft_ready"
+        assert len(production_instances) == 1
+        assert production_instances[0].calls == 1
+    else:
+        assert tuple(outcome) == (
+            "outcome_type",
+            "drafts",
+            "gate_result",
+            "reviews",
+        )
+        assert outcome["outcome_type"] == "review_required"
+        assert composer.calls == 1
+        assert production_instances == []
+    canonical = json.dumps(workflow, ensure_ascii=False, sort_keys=True)
+    assert '"composition"' not in canonical
+    assert '"merged_draft"' not in canonical
+    assert '"disposition"' not in canonical
+    terminal_guard = _Composer()
+    with pytest.raises(
+        state_module.ThreadProtocolError,
+        match="^academic workflow thread is not resumable$",
+    ):
+        await graph_module.resume_academic_workflow(
+            _identity(),
+            adapter,
+            checkpointer=saver,
+            composer=terminal_guard,
+        )
+    assert terminal_guard.calls == 0
 
 
 @pytest.mark.asyncio
@@ -454,6 +627,7 @@ async def test_shape_b_same_decision_actor_replay_and_changed_decision_guard(
         _command(paused.outline, "approve", "actor-B"),
         adapter,
         checkpointer=saver,
+        composer=_Composer(),
     )
     assert result.outline_decision is not None
     assert result.outline_decision.decision == "approve"
@@ -1059,7 +1233,9 @@ async def test_invalid_first_payload_cannot_create_an_eligible_marker(
     saver = InMemorySaver()
     adapter = _Adapter()
     await graph_module.start_academic_workflow(_request(), adapter, checkpointer=saver)
-    graph = graph_module._build_graph(adapter, saver)
+    graph = graph_module._build_graph(
+        adapter, saver, nodes_module._composer_slot(_Composer())
+    )
     config = {"configurable": {"thread_id": "thread-1"}}
     invalid = dict(_APPROVE_COMMAND_PAYLOAD)
     if case == "missing":
@@ -1248,6 +1424,7 @@ async def test_real_cancellation_phases_and_replay(
         paused = await graph_module.start_academic_workflow(
             _request(), adapter, checkpointer=saver
         )
+        composer = _Composer()
         if mode == "terminal_before":
             original_build = nodes_module._build_approval_terminal_state
 
@@ -1268,9 +1445,10 @@ async def test_real_cancellation_phases_and_replay(
             )
         task = asyncio.create_task(
             graph_module.submit_academic_outline_decision(
-                _command(paused.outline, "approve", "actor-A"),
-                adapter,
-                checkpointer=saver,
+                    _command(paused.outline, "approve", "actor-A"),
+                    adapter,
+                    checkpointer=saver,
+                    composer=composer,
             )
         )
         facade_task_holder["task"] = task
@@ -1284,10 +1462,12 @@ async def test_real_cancellation_phases_and_replay(
         await task
     assert caught.value.args[0] == f"CANCEL-{mode}"
 
-    graph = graph_module._build_graph(adapter, saver)
+    graph = graph_module._build_graph(
+        adapter, saver, nodes_module._composer_slot(_Composer())
+    )
     config = {"configurable": {"thread_id": "thread-1"}}
     snapshot = await graph.aget_state(config)
-    restored = state_module.restore_workflow_state(snapshot.values)
+    restored = graph_module._safe_persistent_restore(snapshot.values)
     assert (adapter.plan_calls, adapter.evidence_calls, adapter.outline_calls) == (
         1,
         1,
@@ -1296,10 +1476,12 @@ async def test_real_cancellation_phases_and_replay(
     if terminal_visible:
         assert (restored.phase, restored.status) == (
             "outline_approved",
-            "completed",
+            "running",
         )
+        assert composer.calls == 0
         assert restored.outline_decision is not None
-        assert _events(restored) == _APPROVE_EVENTS
+        assert _events(restored) == _APPROVE_EVENTS[:8]
+        assert snapshot.next == ("academic_draft_composer",)
         with pytest.raises(
             state_module.OutlineDecisionProtocolError,
             match="^academic outline decision has already been committed$",
@@ -1309,6 +1491,15 @@ async def test_real_cancellation_phases_and_replay(
                 adapter,
                 checkpointer=saver,
             )
+        retry_composer = _Composer()
+        completed = await graph_module.resume_academic_workflow(
+            _identity(),
+            adapter,
+            checkpointer=saver,
+            composer=retry_composer,
+        )
+        assert (completed.phase, completed.status) == ("draft_ready", "completed")
+        assert retry_composer.calls == 1
         return
 
     assert (restored.phase, restored.status) == ("outline_ready", "running")
@@ -1378,7 +1569,12 @@ def test_production_api_and_graph_surface_are_statically_closed() -> None:
         "resume_academic_workflow",
         "submit_academic_outline_decision",
     }
-    assert graph_call_owners == expected_facades
+    assert graph_call_owners == {
+        "start_academic_workflow",
+        "submit_academic_outline_decision",
+        "_resume_with_slot",
+        "_ainvoke_sync",
+    }
     runnable_config_owners = {
         name
         for name, function in top_level_functions.items()
@@ -1389,7 +1585,11 @@ def test_production_api_and_graph_surface_are_statically_closed() -> None:
             for node in ast.walk(function)
         )
     }
-    assert runnable_config_owners == expected_facades
+    assert runnable_config_owners == {
+        "start_academic_workflow",
+        "submit_academic_outline_decision",
+        "_resume_with_slot",
+    }
     command_owners = {
         name
         for name, function in top_level_functions.items()
@@ -1568,13 +1768,21 @@ async def test_decision_facade_guard_table_has_fixed_priority_and_zero_mutation(
     fake = CountingGraph()
     builds = 0
 
-    def build(_adapter: object, _checkpointer: object) -> CountingGraph:
+    def build(
+        _adapter: object,
+        _checkpointer: object,
+        _composer_slot: object,
+    ) -> CountingGraph:
         nonlocal builds
         builds += 1
         return fake
 
     monkeypatch.setattr(graph_module, "_build_graph", build)
-    monkeypatch.setattr(graph_module, "_safe_restore", lambda _value: checkpoint_state)
+    monkeypatch.setattr(
+        graph_module,
+        "_safe_persistent_restore",
+        lambda _value: checkpoint_state,
+    )
     state_before = checkpoint_state.model_dump(mode="json")
     snapshot_before = tuple(snapshot)
     with pytest.raises(error_type, match=f"^{message}$") as caught:
@@ -1598,25 +1806,34 @@ async def test_raw_terminal_command_adds_only_framework_resume_write() -> None:
     )
     command = _command(paused.outline, "approve", "actor-A")
     terminal = await graph_module.submit_academic_outline_decision(
-        command, adapter, checkpointer=saver
+        command, adapter, checkpointer=saver, composer=_Composer()
     )
-    graph = graph_module._build_graph(adapter, saver)
+    replay_composer = _Composer()
+    graph = graph_module._build_graph(
+        adapter, saver, nodes_module._composer_slot(replay_composer)
+    )
     config = {"configurable": {"thread_id": "thread-1"}}
     raw = await graph.ainvoke(
         Command(resume=command.model_dump(mode="json")), config=config
     )
     assert raw["workflow"] == terminal.model_dump(mode="json")
+    assert replay_composer.calls == 0
     checkpoint_tuple = await saver.aget_tuple(config)
     assert checkpoint_tuple is not None
     assert [write[1] for write in checkpoint_tuple.pending_writes] == ["__resume__"]
 
 
 @pytest.mark.asyncio
-async def test_terminal_update_is_visible_before_blocked_saver_put_finishes() -> None:
+async def test_terminal_update_is_visible_before_blocked_saver_put_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class BeforePutSaver(InMemorySaver):
         def __init__(self) -> None:
             super().__init__()
             self.blocked = asyncio.Event()
+            self.release = asyncio.Event()
+            self.approved_written = asyncio.Event()
+            self.terminal_written = asyncio.Event()
 
         async def aput(
             self,
@@ -1626,35 +1843,165 @@ async def test_terminal_update_is_visible_before_blocked_saver_put_finishes() ->
             new_versions: object,
         ) -> object:
             workflow = checkpoint.get("channel_values", {}).get("workflow", {})
-            if workflow.get("phase") in ("outline_approved", "outline_rejected"):
+            phase = workflow.get("phase")
+            if phase == "outline_approved":
                 self.blocked.set()
-                await asyncio.Event().wait()
-            return await super().aput(config, checkpoint, metadata, new_versions)
+                await self.release.wait()
+            result = await super().aput(config, checkpoint, metadata, new_versions)
+            if phase == "outline_approved":
+                self.approved_written.set()
+            elif phase in ("draft_ready", "review_required"):
+                self.terminal_written.set()
+            return result
 
     saver = BeforePutSaver()
     adapter = _Adapter()
+    compiled_type = type(graph_module._build_graph(adapter, InMemorySaver()))
+    real_ainvoke = compiled_type.ainvoke
+    durabilities: list[object] = []
+
+    async def recording_ainvoke(
+        self: object, value: object, *args: object, **kwargs: object
+    ) -> object:
+        durabilities.append(kwargs.get("durability"))
+        return await real_ainvoke(self, value, *args, **kwargs)
+
+    monkeypatch.setattr(compiled_type, "ainvoke", recording_ainvoke)
     paused = await graph_module.start_academic_workflow(
         _request(), adapter, checkpointer=saver
     )
+    composer = _Composer()
     task = asyncio.create_task(
         graph_module.submit_academic_outline_decision(
             _command(paused.outline, "approve", "actor-A"),
             adapter,
             checkpointer=saver,
+            composer=composer,
         )
     )
     await saver.blocked.wait()
-    task.cancel("BEFORE-TERMINAL-VISIBLE")
-    with pytest.raises(asyncio.CancelledError) as caught:
-        await task
-    assert caught.value.args[0] == "BEFORE-TERMINAL-VISIBLE"
+    assert composer.calls == 0
+    assert not saver.approved_written.is_set()
+    saver.release.set()
+    result = await task
+    assert composer.calls == 1
+    assert saver.approved_written.is_set()
+    assert saver.terminal_written.is_set()
+    assert durabilities[-1] == "sync"
     snapshot = await graph_module._build_graph(adapter, saver).aget_state(
         {"configurable": {"thread_id": "thread-1"}}
     )
-    state = state_module.restore_workflow_state(snapshot.values)
-    assert (state.phase, state.status) == ("outline_approved", "completed")
+    state = graph_module._safe_persistent_restore(snapshot.values)
+    assert state == result
+    assert (state.phase, state.status) == ("draft_ready", "completed")
     assert state.outline_decision is not None
     assert _events(state) == _APPROVE_EVENTS
+
+    class TerminalFailureSaver(InMemorySaver):
+        def __init__(self, *, after_write: bool) -> None:
+            super().__init__()
+            self.after_write = after_write
+            self.failed = False
+            self.enabled = True
+
+        async def aput(
+            self,
+            config: object,
+            checkpoint: object,
+            metadata: object,
+            new_versions: object,
+        ) -> object:
+            workflow = checkpoint.get("channel_values", {}).get("workflow", {})
+            terminal = workflow.get("phase") in ("draft_ready", "review_required")
+            if terminal and self.enabled and not self.after_write:
+                raise RuntimeError("terminal-pre-write")
+            if terminal and self.enabled and self.after_write and not self.failed:
+                self.failed = True
+                await super().aput(config, checkpoint, metadata, new_versions)
+                raise RuntimeError("terminal-post-write")
+            return await super().aput(config, checkpoint, metadata, new_versions)
+
+        async def aput_writes(
+            self,
+            config: object,
+            writes: object,
+            task_id: str,
+            task_path: str = "",
+        ) -> None:
+            writes_tuple = tuple(writes)
+            terminal = any(
+                channel == "workflow"
+                and type(value) is dict
+                and value.get("phase") in ("draft_ready", "review_required")
+                for channel, value in writes_tuple
+            )
+            if terminal and self.enabled and not self.after_write:
+                raise RuntimeError("terminal-pre-write")
+            await super().aput_writes(config, writes_tuple, task_id, task_path)
+
+    pre_write_saver = TerminalFailureSaver(after_write=False)
+    pre_write_paused = await graph_module.start_academic_workflow(
+        _request(), adapter, checkpointer=pre_write_saver
+    )
+    with pytest.raises(RuntimeError, match="^terminal-pre-write$"):
+        await graph_module.submit_academic_outline_decision(
+            _command(pre_write_paused.outline, "approve", "actor-A"),
+            adapter,
+            checkpointer=pre_write_saver,
+            composer=_Composer(),
+        )
+    pre_write_snapshot = await graph_module._build_graph(
+        adapter, pre_write_saver
+    ).aget_state({"configurable": {"thread_id": "thread-1"}})
+    pre_write_state = graph_module._safe_persistent_restore(
+        pre_write_snapshot.values
+    )
+    assert (pre_write_state.phase, pre_write_state.status) == (
+        "outline_approved",
+        "running",
+    )
+    assert pre_write_snapshot.next == ("academic_draft_composer",)
+    pre_write_saver.enabled = False
+    retry_composer = _Composer()
+    retried = await graph_module.resume_academic_workflow(
+        _identity(), adapter, checkpointer=pre_write_saver, composer=retry_composer
+    )
+    assert retry_composer.calls == 1
+    assert (retried.phase, retried.status) == ("draft_ready", "completed")
+
+    post_write_saver = TerminalFailureSaver(after_write=True)
+    post_write_paused = await graph_module.start_academic_workflow(
+        _request(), adapter, checkpointer=post_write_saver
+    )
+    with pytest.raises(RuntimeError, match="^terminal-post-write$"):
+        await graph_module.submit_academic_outline_decision(
+            _command(post_write_paused.outline, "approve", "actor-A"),
+            adapter,
+            checkpointer=post_write_saver,
+            composer=_Composer(),
+        )
+    post_write_snapshot = await graph_module._build_graph(
+        adapter, post_write_saver
+    ).aget_state({"configurable": {"thread_id": "thread-1"}})
+    post_write_state = graph_module._safe_persistent_restore(
+        post_write_snapshot.values
+    )
+    assert (post_write_state.phase, post_write_state.status) == (
+        "draft_ready",
+        "completed",
+    )
+    guarded_composer = _Composer()
+    with pytest.raises(
+        state_module.ThreadProtocolError,
+        match="^academic workflow thread is not resumable$",
+    ):
+        await graph_module.resume_academic_workflow(
+            _identity(),
+            adapter,
+            checkpointer=post_write_saver,
+            composer=guarded_composer,
+        )
+    assert guarded_composer.calls == 0
 
 
 @pytest.mark.asyncio
@@ -1697,7 +2044,7 @@ async def test_cancellation_after_terminal_visibility_preserves_commit() -> None
     snapshot = await graph_module._build_graph(adapter, saver).aget_state(
         {"configurable": {"thread_id": "thread-1"}}
     )
-    terminal = state_module.restore_workflow_state(snapshot.values)
+    terminal = graph_module._safe_persistent_restore(snapshot.values)
     assert (terminal.phase, terminal.status) == ("outline_rejected", "completed")
     assert terminal.outline_decision is not None
     assert terminal.outline_decision.actor_assertion == "actor-A"
@@ -1722,7 +2069,9 @@ async def test_raw_shape_b_replay_accepts_same_or_value_equal_command(
     paused = await graph_module.start_academic_workflow(
         _request(), adapter, checkpointer=saver
     )
-    graph = graph_module._build_graph(adapter, saver)
+    graph = graph_module._build_graph(
+        adapter, saver, nodes_module._composer_slot(_Composer())
+    )
     config = {"configurable": {"thread_id": "thread-1"}}
     original = nodes_module._build_approval_terminal_state
     calls = 0
@@ -1742,7 +2091,7 @@ async def test_raw_shape_b_replay_accepts_same_or_value_equal_command(
     retry = first if reuse_same_command else Command(resume=dict(payload))
     await graph.ainvoke(retry, config=config)
     snapshot = await graph.aget_state(config)
-    terminal = state_module.restore_workflow_state(snapshot.values)
+    terminal = graph_module._safe_persistent_restore(snapshot.values)
     assert terminal.outline_decision is not None
     assert terminal.outline_decision.decision == "approve"
     assert terminal.outline_decision.actor_assertion == "actor-A"
@@ -1757,7 +2106,9 @@ async def test_raw_changed_decision_replays_retained_first_payload(
     paused = await graph_module.start_academic_workflow(
         _request(), adapter, checkpointer=saver
     )
-    graph = graph_module._build_graph(adapter, saver)
+    graph = graph_module._build_graph(
+        adapter, saver, nodes_module._composer_slot(_Composer())
+    )
     config = {"configurable": {"thread_id": "thread-1"}}
     original = nodes_module._build_approval_terminal_state
     calls = 0
@@ -1779,7 +2130,9 @@ async def test_raw_changed_decision_replays_retained_first_payload(
     await graph.ainvoke(
         Command(resume=reject.model_dump(mode="json")), config=config
     )
-    terminal = state_module.restore_workflow_state((await graph.aget_state(config)).values)
+    terminal = graph_module._safe_persistent_restore(
+        (await graph.aget_state(config)).values
+    )
     assert terminal.outline_decision is not None
     assert terminal.outline_decision.decision == "approve"
     assert terminal.outline_decision.actor_assertion == "actor-A"
@@ -1795,7 +2148,10 @@ def _assert_snapshot_oracle(
 ) -> None:
     assert type(snapshot) is StateSnapshot
     assert type(snapshot.values) is dict
-    assert snapshot.values == {"workflow": state.model_dump(mode="json")}
+    expected_workflow = state.model_dump(mode="json")
+    if kind != "terminal":
+        expected_workflow.pop("outcome", None)
+    assert snapshot.values == {"workflow": expected_workflow}
     workflow = snapshot.values["workflow"]
     assert workflow["request"]["report_mode"] == _FIXED_MODE
     assert workflow["request"]["report_locale"] == _FIXED_LOCALE
@@ -1808,7 +2164,9 @@ def _assert_snapshot_oracle(
     assert snapshot.created_at is not None and type(snapshot.created_at) is str
     assert snapshot.metadata == {
         "source": "loop",
-        "step": 4 if kind == "terminal" else 3,
+        "step": 5 if kind == "terminal" and decision == "approve" else (
+            4 if kind == "terminal" else 3
+        ),
         "parents": {},
     }
     assert type(snapshot.config) is dict
@@ -1832,7 +2190,7 @@ def _assert_snapshot_oracle(
         "updated_channels",
         "channel_values",
     )
-    assert checkpoint["channel_values"]["workflow"] == state.model_dump(mode="json")
+    assert checkpoint["channel_values"]["workflow"] == expected_workflow
 
     if kind == "terminal":
         assert snapshot.next == ()
@@ -1906,7 +2264,9 @@ async def test_complete_snapshot_oracle_and_sensitive_walker(
     paused = await graph_module.start_academic_workflow(
         _request(), adapter, checkpointer=saver
     )
-    graph = graph_module._build_graph(adapter, saver)
+    graph = graph_module._build_graph(
+        adapter, saver, nodes_module._composer_slot(_Composer())
+    )
     pause_snapshot = await graph.aget_state(config)
     pause_tuple = await saver.aget_tuple(config)
     _assert_snapshot_oracle(
@@ -1949,7 +2309,7 @@ async def test_complete_snapshot_oracle_and_sensitive_walker(
 
     retry_command = _command(paused.outline, decision, "actor-B")
     terminal = await graph_module.submit_academic_outline_decision(
-        retry_command, adapter, checkpointer=saver
+        retry_command, adapter, checkpointer=saver, composer=_Composer()
     )
     terminal_snapshot = await graph.aget_state(config)
     terminal_tuple = await saver.aget_tuple(config)

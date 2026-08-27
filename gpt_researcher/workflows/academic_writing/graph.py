@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 from langchain_core.runnables import RunnableConfig
@@ -12,10 +13,14 @@ from langgraph.types import Command, Interrupt, PregelTask, StateSnapshot
 from .adapters import AcademicWritingAdapter
 from .report_profiles import _FIXED_REPORT_MODES
 from .nodes import (
+    _AcademicDraftComposer,
+    _ComposerDependencySlot,
     _OutlineApproveCommitError,
     _OutlineRejectCommitError,
     _approval_interrupt_payload,
+    _composer_slot,
     _make_nodes,
+    _route_after_approval,
     _route_after_node,
     _validated_dto,
 )
@@ -33,6 +38,10 @@ from .state import (
     restore_workflow_state,
     validate_json_value,
     workflow_to_graph_state,
+)
+from .workflow_outcome import (
+    AcademicWorkflowPersistentState,
+    _restore_persistent_workflow_state,
 )
 
 
@@ -80,18 +89,44 @@ _REQUEST_ALLOWED_FIELD_SETS = (
 )
 
 
+async def _ainvoke_sync(graph: object, value: object, config: RunnableConfig) -> object:
+    operation = asyncio.create_task(
+        graph.ainvoke(value, config=config, durability="sync")  # type: ignore[union-attr]
+    )
+    try:
+        result = await asyncio.shield(operation)
+    except asyncio.CancelledError as cancellation:
+        operation.cancel(*cancellation.args)
+        try:
+            await operation
+        except asyncio.CancelledError:
+            pass
+        del operation
+        raise
+    del operation
+    return result
+
+
 def _build_graph(
     adapter: AcademicWritingAdapter,
     checkpointer: BaseCheckpointSaver,
+    composer_slot: _ComposerDependencySlot | None = None,
 ):
-    topic_planner, research_evidence, outline_writer, outline_approval = _make_nodes(
-        adapter
-    )
+    if composer_slot is None:
+        composer_slot = _composer_slot(None)
+    (
+        topic_planner,
+        research_evidence,
+        outline_writer,
+        outline_approval,
+        academic_draft_composer,
+    ) = _make_nodes(adapter, composer_slot)
     builder = StateGraph(AcademicWorkflowGraphState)
     builder.add_node("topic_planner", topic_planner)
     builder.add_node("research_evidence", research_evidence)
     builder.add_node("outline_writer", outline_writer)
     builder.add_node("outline_approval", outline_approval)
+    builder.add_node("academic_draft_composer", academic_draft_composer)
     builder.add_edge(START, "topic_planner")
     builder.add_conditional_edges(
         "topic_planner",
@@ -108,7 +143,12 @@ def _build_graph(
         _route_after_node,
         {"continue": "outline_approval", "end": END},
     )
-    builder.add_edge("outline_approval", END)
+    builder.add_conditional_edges(
+        "outline_approval",
+        _route_after_approval,
+        {"compose": "academic_draft_composer", "end": END},
+    )
+    builder.add_edge("academic_draft_composer", END)
     return builder.compile(checkpointer=checkpointer)
 
 
@@ -176,6 +216,20 @@ def _safe_restore(graph_state: object) -> AcademicWorkflowState:
         failed = True
     if failed or state is None:
         raise InvariantError()
+    return state
+
+
+def _safe_persistent_restore(graph_state: object) -> AcademicWorkflowPersistentState:
+    failed = False
+    state: AcademicWorkflowPersistentState | None = None
+    try:
+        if type(graph_state) is not dict:
+            raise TypeError("graph result must be a mapping")
+        state = _restore_persistent_workflow_state(graph_state)
+    except Exception:
+        failed = True
+    if failed or state is None:
+        raise InvariantError() from None
     return state
 
 
@@ -321,7 +375,7 @@ async def start_academic_workflow(
     adapter: AcademicWritingAdapter,
     *,
     checkpointer: BaseCheckpointSaver,
-) -> AcademicWorkflowState:
+) -> AcademicWorkflowPersistentState:
     """Start a new guarded workflow thread."""
 
     mode_explicit, locale_explicit, selected_mode, selected_locale = (
@@ -333,7 +387,8 @@ async def start_academic_workflow(
         thread_id=validated_request.thread_id,
         run_id=validated_request.run_id,
     )
-    graph = _build_graph(adapter, checkpointer)
+    slot = _composer_slot(None)
+    graph = _build_graph(adapter, checkpointer, slot)
     config: RunnableConfig = {
         "configurable": {"thread_id": identity.thread_id}
     }
@@ -365,29 +420,28 @@ async def start_academic_workflow(
             workflow_to_graph_state(initial_state), config=config
         )
         completed_snapshot = await graph.aget_state(config)
-        completed_state = _safe_restore(completed_snapshot.values)
+        completed_state = _safe_persistent_restore(completed_snapshot.values)
         if completed_state.status == "failed":
             return completed_state
         if _approval_shape(completed_snapshot, completed_state) != "pause":
             raise InvariantError() from None
         return completed_state
 
-    checkpoint_state = _safe_restore(snapshot.values)
+    checkpoint_state = _safe_persistent_restore(snapshot.values)
     if not _identity_matches(checkpoint_state, identity):
         raise ThreadProtocolError("identity")
     raise ThreadProtocolError("exists")
 
 
-async def resume_academic_workflow(
+async def _resume_with_slot(
     identity: AcademicWorkflowIdentity,
     adapter: AcademicWritingAdapter,
     *,
     checkpointer: BaseCheckpointSaver,
-) -> AcademicWorkflowState:
-    """Resume the single pending node of an existing workflow thread."""
-
+    slot: _ComposerDependencySlot,
+) -> AcademicWorkflowPersistentState:
     validated_identity = _safe_input(identity, AcademicWorkflowIdentity)
-    graph = _build_graph(adapter, checkpointer)
+    graph = _build_graph(adapter, checkpointer, slot)
     config: RunnableConfig = {
         "configurable": {"thread_id": validated_identity.thread_id}
     }
@@ -395,7 +449,7 @@ async def resume_academic_workflow(
     if snapshot.created_at is None:
         raise ThreadProtocolError("missing")
 
-    checkpoint_state = _safe_restore(snapshot.values)
+    checkpoint_state = _safe_persistent_restore(snapshot.values)
     if not _identity_matches(checkpoint_state, validated_identity):
         raise ThreadProtocolError("identity")
     if checkpoint_state.status in ("completed", "failed"):
@@ -412,19 +466,49 @@ async def resume_academic_workflow(
         "initialized": ("topic_planner",),
         "topic_planned": ("research_evidence",),
         "evidence_collected": ("outline_writer",),
+        "outline_approved": ("academic_draft_composer",),
     }
     expected = expected_nodes.get(checkpoint_state.phase)
     if expected is None or snapshot.next != expected:
         raise InvariantError()
 
-    await graph.ainvoke(None, config=config)
+    try:
+        await _ainvoke_sync(graph, None, config)
+    finally:
+        slot.clear()
     resumed_snapshot = await graph.aget_state(config)
-    resumed_state = _safe_restore(resumed_snapshot.values)
-    if resumed_state.status == "failed":
+    resumed_state = _safe_persistent_restore(resumed_snapshot.values)
+    if resumed_state.status == "failed" or resumed_state.phase in (
+        "draft_ready",
+        "review_required",
+    ):
         return resumed_state
     if _approval_shape(resumed_snapshot, resumed_state) != "pause":
         raise InvariantError() from None
     return resumed_state
+
+
+async def resume_academic_workflow(
+    identity: AcademicWorkflowIdentity,
+    adapter: AcademicWritingAdapter,
+    *,
+    checkpointer: BaseCheckpointSaver,
+    composer: _AcademicDraftComposer | None = None,
+) -> AcademicWorkflowPersistentState:
+    """Resume the single pending node of an existing workflow thread."""
+
+    slot = _composer_slot(composer)
+    del composer
+    try:
+        result = await _resume_with_slot(
+            identity,
+            adapter,
+            checkpointer=checkpointer,
+            slot=slot,
+        )
+    finally:
+        slot.clear()
+    return result
 
 
 async def submit_academic_outline_decision(
@@ -432,14 +516,18 @@ async def submit_academic_outline_decision(
     adapter: AcademicWritingAdapter,
     *,
     checkpointer: BaseCheckpointSaver,
-) -> AcademicWorkflowState:
+    composer: _AcademicDraftComposer | None = None,
+) -> AcademicWorkflowPersistentState:
     """Submit one strictly bound decision to an available outline checkpoint."""
 
-    async def _sensitive_decision_attempt() -> AcademicWorkflowState | object:
+    slot = _composer_slot(composer)
+    del composer
+
+    async def _sensitive_decision_attempt() -> AcademicWorkflowPersistentState | object:
         validated_command = _safe_decision_command(command)
         if validated_command is None:
             return _DECISION_INVALID
-        graph = _build_graph(adapter, checkpointer)
+        graph = _build_graph(adapter, checkpointer, slot)
         config: RunnableConfig = {
             "configurable": {"thread_id": validated_command.thread_id}
         }
@@ -448,7 +536,7 @@ async def submit_academic_outline_decision(
             return _DECISION_MISSING
 
         try:
-            checkpoint_state = _safe_restore(snapshot.values)
+            checkpoint_state = _safe_persistent_restore(snapshot.values)
         except InvariantError:
             return _DECISION_INVARIANT
         if (
@@ -463,7 +551,13 @@ async def submit_academic_outline_decision(
             return _DECISION_IDENTITY
         if (
             checkpoint_state.outline_decision is not None
-            or checkpoint_state.phase in ("outline_approved", "outline_rejected")
+            or checkpoint_state.phase
+            in (
+                "outline_approved",
+                "outline_rejected",
+                "draft_ready",
+                "review_required",
+            )
             or checkpoint_state.status in ("completed", "failed")
         ):
             return _DECISION_COMMITTED
@@ -489,23 +583,23 @@ async def submit_academic_outline_decision(
 
         resume_mapping = validated_command.model_dump(mode="json")
         try:
-            await graph.ainvoke(Command(resume=resume_mapping), config=config)
+            await _ainvoke_sync(graph, Command(resume=resume_mapping), config)
         except _OutlineApproveCommitError:
             return _DECISION_APPROVE_COMMIT
         except _OutlineRejectCommitError:
             return _DECISION_REJECT_COMMIT
         terminal_snapshot = await graph.aget_state(config)
         try:
-            terminal_state = _safe_restore(terminal_snapshot.values)
+            terminal_state = _safe_persistent_restore(terminal_snapshot.values)
         except InvariantError:
             return _DECISION_INVARIANT
-        expected_phase = (
-            "outline_approved"
+        expected_phases = (
+            ("draft_ready", "review_required")
             if validated_command.decision == "approve"
-            else "outline_rejected"
+            else ("outline_rejected",)
         )
         if (
-            terminal_state.phase != expected_phase
+            terminal_state.phase not in expected_phases
             or terminal_state.status != "completed"
             or terminal_state.outline_decision is None
             or terminal_state.outline_decision.decision != validated_command.decision
@@ -514,8 +608,15 @@ async def submit_academic_outline_decision(
             return _DECISION_INVARIANT
         return terminal_state
 
-    outcome = await _sensitive_decision_attempt()
-    if type(outcome) is AcademicWorkflowState:
+    try:
+        outcome = await _sensitive_decision_attempt()
+    except asyncio.CancelledError:
+        slot.clear()
+        del command, adapter, checkpointer, _sensitive_decision_attempt
+        raise
+    finally:
+        slot.clear()
+    if type(outcome) is AcademicWorkflowPersistentState:
         return outcome
     failure = outcome
     del command, adapter, checkpointer, outcome, _sensitive_decision_attempt

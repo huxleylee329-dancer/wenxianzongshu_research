@@ -28,6 +28,18 @@ from gpt_researcher.workflows.academic_writing import graph as graph_module
 from gpt_researcher.workflows.academic_writing import nodes as nodes_module
 from gpt_researcher.workflows.academic_writing import state as state_module
 from gpt_researcher.workflows.academic_writing.adapters import AcademicWritingAdapter
+from gpt_researcher.workflows.academic_writing.academic_draft_composer import (
+    WorkflowAcademicDraftComposition,
+)
+from gpt_researcher.workflows.academic_writing.citation_evidence_gate import (
+    WorkflowCitationEvidenceGateResult,
+)
+from gpt_researcher.workflows.academic_writing.citation_review_disposition import (
+    WorkflowCitationReviewDisposition,
+)
+from gpt_researcher.workflows.academic_writing.citation_reviewer import (
+    WorkflowSectionCitationReview,
+)
 from gpt_researcher.workflows.academic_writing.graph import (
     resume_academic_workflow,
     start_academic_workflow,
@@ -46,11 +58,18 @@ from gpt_researcher.workflows.academic_writing.state import (
     WorkflowOutline,
     WorkflowOutlineSection,
     WorkflowResearchEvidence,
+    WorkflowSectionDraft,
     WorkflowTopicPlan,
     restore_workflow_state,
 )
 from gpt_researcher.workflows.academic_writing.report_profiles import (
     _get_report_profile,
+)
+from gpt_researcher.workflows.academic_writing.references_renderer import (
+    WorkflowReferencedDraft,
+)
+from gpt_researcher.workflows.academic_writing.section_merger import (
+    WorkflowMergedDraft,
 )
 
 
@@ -320,16 +339,118 @@ class FakeAdapter(AcademicWritingAdapter):
         return self.outline_result  # type: ignore[return-value]
 
 
+def _composition(verdict: str = "supported") -> WorkflowAcademicDraftComposition:
+    outline = _outline()
+    section_ids = tuple(section.section_id for section in outline.sections)
+    citations = tuple(("evidence-source:000001",) for _ in section_ids)
+    drafts = tuple(
+        WorkflowSectionDraft(
+            outline_id=outline.outline_id,
+            section_id=section_id,
+            attempt=1,
+            content="Claim [[cite:evidence-source:000001]]",
+        )
+        for section_id in section_ids
+    )
+    gate = WorkflowCitationEvidenceGateResult(
+        outline_id=outline.outline_id,
+        section_ids=section_ids,
+        cited_source_ids_by_section=citations,
+        attempt=1,
+    )
+    if verdict == "supported":
+        section_disposition = "ready"
+        issues: tuple[str, ...] = ()
+    elif verdict == "uncertain":
+        section_disposition = "needs_human_review"
+        issues = ("insufficient_evidence",)
+    else:
+        section_disposition = "blocked"
+        issues = ("possible_contradiction",)
+    reviews = tuple(
+        WorkflowSectionCitationReview(
+            outline_id=outline.outline_id,
+            section_id=section_id,
+            cited_source_ids=cited,
+            verdict=verdict,
+            issues=issues,
+            rationale="Bounded model opinion.",
+            attempt=1,
+        )
+        for section_id, cited in zip(section_ids, citations, strict=True)
+    )
+    disposition = WorkflowCitationReviewDisposition(
+        outline_id=outline.outline_id,
+        section_ids=section_ids,
+        section_dispositions=tuple(section_disposition for _ in section_ids),
+        disposition=section_disposition,
+        attempt=1,
+    )
+    merged = None
+    referenced = None
+    if verdict == "supported":
+        merged = WorkflowMergedDraft(
+            outline_id=outline.outline_id,
+            section_ids=section_ids,
+            attempt=1,
+            content="Merged",
+        )
+        referenced = WorkflowReferencedDraft(
+            outline_id=outline.outline_id,
+            section_ids=section_ids,
+            reference_source_ids=("evidence-source:000001",),
+            attempt=1,
+            content="Merged\n\n## References\n\nopaque",
+        )
+    return WorkflowAcademicDraftComposition(
+        drafts=drafts,
+        gate_result=gate,
+        reviews=reviews,
+        disposition=disposition,
+        merged_draft=merged,
+        referenced_draft=referenced,
+    )
+
+
+class FakeComposer:
+    def __init__(
+        self,
+        result: object | None = None,
+        *,
+        error: BaseException | None = None,
+        costs: list[str] | None = None,
+    ) -> None:
+        self.result = _composition() if result is None else result
+        self.error = error
+        self.calls = 0
+        self.states: list[object] = []
+        self.costs = costs
+
+    async def compose(self, state: object) -> object:
+        self.calls += 1
+        self.states.append(state)
+        if self.costs is not None:
+            self.costs.extend(("writer:section-1", "reviewer:section-1"))
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
 def _event_projection(state: object) -> list[tuple[str, str | None]]:
     return [(event.event_type, event.node_id) for event in state.events]  # type: ignore[attr-defined]
 
 
 def _assert_traceback_surface_has_no_sentinel(
-    error: BaseException, sentinel: str
+    error: BaseException,
+    sentinel: str,
+    *,
+    forbidden_identity: object | None = None,
 ) -> list[str]:
     seen: set[int] = set()
 
     def visit(value: object) -> None:
+        if forbidden_identity is not None:
+            assert value is not forbidden_identity
         if id(value) in seen:
             return
         seen.add(id(value))
@@ -368,12 +489,19 @@ def _assert_traceback_surface_has_no_sentinel(
                 visit(item)
 
     frame_names: list[str] = []
-    visit(error)
+    if forbidden_identity is None:
+        visit(error)
     current = error.__traceback__
     while current is not None:
         frame_names.append(current.tb_frame.f_code.co_name)
-        for value in current.tb_frame.f_locals.values():
-            visit(value)
+        if (
+            forbidden_identity is None
+            or current.tb_frame.f_globals.get("__name__", "").startswith(
+                "gpt_researcher.workflows.academic_writing"
+            )
+        ):
+            for value in current.tb_frame.f_locals.values():
+                visit(value)
         if current.tb_frame.f_code.co_name in {
             "_topic_planner",
             "_research_evidence",
@@ -499,7 +627,11 @@ def _compiled_for_test(adapter: AcademicWritingAdapter, saver: InMemorySaver):
     # returns the compiled graph.
     from gpt_researcher.workflows.academic_writing.graph import _build_graph
 
-    return _build_graph(adapter, saver)
+    return _build_graph(
+        adapter,
+        saver,
+        nodes_module._composer_slot(FakeComposer()),
+    )
 
 
 @pytest.mark.asyncio
@@ -509,6 +641,12 @@ def _compiled_for_test(adapter: AcademicWritingAdapter, saver: InMemorySaver):
         ("topic_planner", "initialized", 0, ("topic_planner",)),
         ("research_evidence", "topic_planned", 2, ("research_evidence",)),
         ("outline_writer", "evidence_collected", 4, ("outline_writer",)),
+        (
+            "academic_draft_composer",
+            "outline_approved",
+            8,
+            ("academic_draft_composer",),
+        ),
     ],
 )
 async def test_raw_exception_is_fixed_safe_and_natively_resumable(
@@ -519,10 +657,53 @@ async def test_raw_exception_is_fixed_safe_and_natively_resumable(
 ) -> None:
     saver = InMemorySaver()
     crashing = FakeAdapter()
-    crashing.raise_at = failed_node
+    costs: list[str] = []
+    composer_target: object | None = None
 
-    with pytest.raises(ExecutionError) as caught:
-        await start_academic_workflow(_request(), crashing, checkpointer=saver)
+    if failed_node == "academic_draft_composer":
+        paused = await start_academic_workflow(
+            _request(), crashing, checkpointer=saver
+        )
+        class ClosureFailingComposer(FakeComposer):
+            pass
+
+        failing_composer = ClosureFailingComposer(
+            error=RuntimeError(SECRET), costs=costs
+        )
+        composer_target = failing_composer
+
+        async def closure_failure(self: object, state: object) -> object:
+            assert self is failing_composer
+            failing_composer.calls += 1
+            failing_composer.states.append(state)
+            if failing_composer.costs is not None:
+                failing_composer.costs.extend(
+                    ("writer:section-1", "reviewer:section-1")
+                )
+            raise RuntimeError(SECRET)
+
+        ClosureFailingComposer.compose = closure_failure  # type: ignore[method-assign]
+        with pytest.raises(ExecutionError) as caught:
+            await submit_academic_outline_decision(
+                AcademicOutlineDecisionCommand(
+                    schema_version="1",
+                    workflow_id=paused.workflow_id,
+                    thread_id=paused.thread_id,
+                    run_id=paused.run_id,
+                    outline_id=paused.outline.outline_id,
+                    outline_digest=state_module._outline_digest(paused.outline),
+                    decision="approve",
+                    actor_assertion="human approval",
+                ),
+                crashing,
+                checkpointer=saver,
+                composer=failing_composer,
+            )
+        assert failing_composer.calls == 1
+    else:
+        crashing.raise_at = failed_node
+        with pytest.raises(ExecutionError) as caught:
+            await start_academic_workflow(_request(), crashing, checkpointer=saver)
 
     error = caught.value
     assert str(error) == "academic workflow execution failed"
@@ -533,11 +714,19 @@ async def test_raw_exception_is_fixed_safe_and_natively_resumable(
     assert SECRET not in str(error)
     assert SECRET not in repr(error)
     assert SECRET not in rendered
-    _assert_traceback_surface_has_no_sentinel(error, SECRET)
+    _assert_traceback_surface_has_no_sentinel(
+        error,
+        SECRET,
+        forbidden_identity=composer_target,
+    )
 
     graph = _compiled_for_test(crashing, saver)
     snapshot = await graph.aget_state({"configurable": {"thread_id": "thread-1"}})
-    checkpoint_state = restore_workflow_state(snapshot.values)
+    checkpoint_state = (
+        graph_module._safe_persistent_restore(snapshot.values)
+        if failed_node == "academic_draft_composer"
+        else restore_workflow_state(snapshot.values)
+    )
     assert checkpoint_state.phase == expected_phase
     assert checkpoint_state.status == "running"
     assert len(checkpoint_state.events) == event_count
@@ -546,9 +735,23 @@ async def test_raw_exception_is_fixed_safe_and_natively_resumable(
     assert SECRET not in repr(snapshot.tasks)
     assert SECRET not in repr(snapshot.metadata)
 
+    retry_composer = FakeComposer(costs=costs)
     recovered = await resume_academic_workflow(
-        _identity(), FakeAdapter(), checkpointer=saver
+        _identity(),
+        FakeAdapter(),
+        checkpointer=saver,
+        composer=retry_composer if failed_node == "academic_draft_composer" else None,
     )
+    if failed_node == "academic_draft_composer":
+        assert (recovered.phase, recovered.status) == ("draft_ready", "completed")
+        assert retry_composer.calls == 1
+        assert costs == [
+            "writer:section-1",
+            "reviewer:section-1",
+            "writer:section-1",
+            "reviewer:section-1",
+        ]
+        return
     assert _event_projection(recovered) == SUCCESS_EVENTS
     clean = await start_academic_workflow(
         _request(), FakeAdapter(), checkpointer=InMemorySaver()
@@ -560,6 +763,7 @@ async def test_raw_exception_is_fixed_safe_and_natively_resumable(
 @pytest.mark.parametrize("bad_result", [object(), {"unexpected": "mapping"}])
 async def test_invalid_adapter_response_is_fixed_invariant_and_resumable(
     bad_result: object,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     saver = InMemorySaver()
     adapter = FakeAdapter()
@@ -576,6 +780,148 @@ async def test_invalid_adapter_response_is_fixed_invariant_and_resumable(
         _identity(), FakeAdapter(), checkpointer=saver
     )
     assert _event_projection(recovered) == SUCCESS_EVENTS
+
+    class BlockingComposer(FakeComposer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+
+    blocking = BlockingComposer()
+
+    async def closure_compose(self: object, state: object) -> object:
+        assert self is blocking
+        blocking.calls += 1
+        blocking.states.append(state)
+        blocking.entered.set()
+        await asyncio.Event().wait()
+
+    BlockingComposer.compose = closure_compose  # type: ignore[method-assign]
+    real_composer_slot = graph_module._composer_slot
+    recorded_slots: list[object] = []
+
+    def recording_slot(choice: object) -> object:
+        slot = real_composer_slot(choice)
+        if choice is not None:
+            recorded_slots.append(slot)
+        return slot
+
+    monkeypatch.setattr(graph_module, "_composer_slot", recording_slot)
+    command = AcademicOutlineDecisionCommand(
+        schema_version="1",
+        workflow_id=recovered.workflow_id,
+        thread_id=recovered.thread_id,
+        run_id=recovered.run_id,
+        outline_id=recovered.outline.outline_id,
+        outline_digest=state_module._outline_digest(recovered.outline),
+        decision="approve",
+        actor_assertion="human approval",
+    )
+    composer_task = asyncio.create_task(
+        submit_academic_outline_decision(
+            command,
+            FakeAdapter(),
+            checkpointer=saver,
+            composer=blocking,
+        )
+    )
+    await blocking.entered.wait()
+    composer_task.cancel("COMPOSER-CANCELLED")
+    with pytest.raises(asyncio.CancelledError) as composer_cancel:
+        await composer_task
+    assert composer_cancel.value.args == ("COMPOSER-CANCELLED",)
+    assert len(recorded_slots) == 1
+    assert recorded_slots[0].is_empty()
+    _assert_traceback_surface_has_no_sentinel(
+        composer_cancel.value,
+        "FORBIDDEN-COMPOSER-SENSITIVE-TEXT",
+        forbidden_identity=blocking,
+    )
+    pending = await _compiled_for_test(FakeAdapter(), saver).aget_state(
+        {"configurable": {"thread_id": "thread-1"}}
+    )
+    pending_state = graph_module._safe_persistent_restore(pending.values)
+    assert (pending_state.phase, pending_state.status, pending_state.outcome) == (
+        "outline_approved",
+        "running",
+        None,
+    )
+    assert pending.next == ("academic_draft_composer",)
+
+    if type(bad_result) is object:
+        valid_composition = _composition()
+        assert valid_composition.referenced_draft is not None
+        referenced = valid_composition.referenced_draft
+        outcome_sentinel = "TERMINAL-OUTCOME-REACHABILITY-SENTINEL"
+        sentinel_referenced = WorkflowReferencedDraft(
+            outline_id=referenced.outline_id,
+            section_ids=referenced.section_ids,
+            reference_source_ids=referenced.reference_source_ids,
+            attempt=referenced.attempt,
+            content=referenced.content + outcome_sentinel,
+        )
+        transition_composition = WorkflowAcademicDraftComposition(
+            drafts=valid_composition.drafts,
+            gate_result=valid_composition.gate_result,
+            reviews=valid_composition.reviews,
+            disposition=valid_composition.disposition,
+            merged_draft=valid_composition.merged_draft,
+            referenced_draft=sentinel_referenced,
+        )
+        terminal_targets: list[object] = []
+
+        def fail_after_terminal(terminal: object) -> object:
+            terminal_targets.append(terminal)
+            raise RuntimeError("transition-validation-failure")
+
+        transition_composer = FakeComposer(result=transition_composition)
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                nodes_module,
+                "_validated_persistent_transition",
+                fail_after_terminal,
+            )
+            with pytest.raises(ExecutionError) as transition_error:
+                await resume_academic_workflow(
+                    _identity(),
+                    FakeAdapter(),
+                    checkpointer=saver,
+                    composer=transition_composer,
+                )
+        assert len(terminal_targets) == 1
+        assert transition_composer.calls == 1
+        assert recorded_slots[-1].is_empty()
+        assert str(transition_error.value) == "academic workflow execution failed"
+        assert transition_error.value.__cause__ is None
+        assert transition_error.value.__context__ is None
+        _assert_traceback_surface_has_no_sentinel(
+            transition_error.value,
+            outcome_sentinel,
+            forbidden_identity=terminal_targets[0],
+        )
+    invalid_composer = FakeComposer(result=bad_result)
+    with pytest.raises(InvariantError) as composer_error:
+        await resume_academic_workflow(
+            _identity(),
+            FakeAdapter(),
+            checkpointer=saver,
+            composer=invalid_composer,
+        )
+    assert str(composer_error.value) == "academic workflow invariant violation"
+    assert invalid_composer.calls == 1
+    assert len(recorded_slots) == (
+        3 if type(bad_result) is object else 2
+    )
+    assert all(slot.is_empty() for slot in recorded_slots)
+    pending = await _compiled_for_test(FakeAdapter(), saver).aget_state(
+        {"configurable": {"thread_id": "thread-1"}}
+    )
+    pending_state = graph_module._safe_persistent_restore(pending.values)
+    assert (pending_state.phase, pending_state.status, pending_state.outcome) == (
+        "outline_approved",
+        "running",
+        None,
+    )
+    assert pending.next == ("academic_draft_composer",)
 
 
 @pytest.mark.asyncio
@@ -757,30 +1103,26 @@ async def test_start_and_resume_thread_guards_use_fixed_priority(
         actor_assertion="human approval",
     )
     stage = "approval_resume"
+    composer = FakeComposer()
     approved = await submit_academic_outline_decision(
         command,
         FakeAdapter(),
         checkpointer=saver,
+        composer=composer,
     )
-    assert (approved.phase, approved.status) == ("outline_approved", "completed")
+    assert (approved.phase, approved.status) == ("draft_ready", "completed")
+    assert composer.calls == 1
     assert [name for name, _digest in digest_calls] == [
         "approval_create",
         "approval_create",
         "checkpoint_restore",
-        "approval_resume",
-        "approval_resume",
-        "approval_resume",
-        "approval_resume",
-        "approval_resume",
-        "approval_resume",
-        "approval_resume",
-    ]
+    ] + ["approval_resume"] * 16
 
     stage = "checkpoint_restore"
     terminal_snapshot = await _compiled_for_test(
         FakeAdapter(), saver
     ).aget_state({"configurable": {"thread_id": "thread-1"}})
-    restored = restore_workflow_state(terminal_snapshot.values)
+    restored = graph_module._safe_persistent_restore(terminal_snapshot.values)
     assert restored == approved
     assert [name for name, _digest in digest_calls].count("checkpoint_restore") == 2
 
@@ -804,6 +1146,16 @@ async def test_start_and_resume_thread_guards_use_fixed_priority(
     [
         ((), ThreadProtocolError, "academic workflow thread is not resumable"),
         (("outline_writer",), InvariantError, "academic workflow invariant violation"),
+        (
+            ("research_evidence", "outline_writer"),
+            InvariantError,
+            "academic workflow invariant violation",
+        ),
+        (
+            ("outline_writer", "research_evidence"),
+            InvariantError,
+            "academic workflow invariant violation",
+        ),
     ],
 )
 async def test_resume_rejects_empty_and_phase_mismatched_next(
@@ -841,7 +1193,7 @@ async def test_resume_rejects_empty_and_phase_mismatched_next(
     monkeypatch.setattr(
         graph_module,
         "_build_graph",
-        lambda adapter, checkpointer: fake_graph,
+        lambda adapter, checkpointer, composer_slot: fake_graph,
     )
     with pytest.raises(error_type) as caught:
         await resume_academic_workflow(
@@ -1024,7 +1376,8 @@ def test_new_modules_do_not_import_legacy_or_external_components() -> None:
     ):
         source = (root / relative).read_text(encoding="utf-8")
         assert "multi_agents" not in source
-        assert "GPTResearcher" not in source
+        if relative.endswith(("state.py", "adapters.py")):
+            assert "GPTResearcher" not in source
         assert "ResearchConductor" not in source
 
 
