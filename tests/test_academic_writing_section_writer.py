@@ -43,22 +43,21 @@ _SYSTEM_MESSAGE = (
     "Chinese citation brackets such as 【1】, a marker containing multiple IDs, "
     "an unknown ID, or the literal placeholder [[cite:<source_id>]]. Do not use "
     "[ or ] anywhere except inside an exact copied citation_marker and do not "
-    "emit the literal substring ://. Return exactly one JSON object with the "
-    "keys citations and content. citations must be non-empty and exactly the "
-    "unique source IDs in first-marker order; content must contain only the "
-    "section body and its inline citation markers. Return no identifiers outside "
-    "citations, no code fence, comments, trailing prose, or extra keys. Write in "
-    "the requested language."
+    "emit the literal substring ://. Return exactly one JSON object in the "
+    "recommended form {\"content\":\"...\"}. content must contain only the "
+    "section body and its inline citation markers. Do not return a separate "
+    "citation plan, code fence, comments, trailing prose, or extra keys. Write "
+    "in the requested language."
 )
 _RETRY_SUFFIX = (
     " Your previous response was invalid. Return a non-empty content string "
     "containing at least one actual citation_marker copied exactly from "
-    "evidence_sources. The citations array must be non-empty and exactly equal "
-    "the unique source IDs in first-marker order. Do not use Markdown numeric "
-    "citations such as [1], Chinese citation brackets such as 【1】, combine "
-    "multiple IDs in one marker, use an unknown ID, or emit the literal "
-    "placeholder [[cite:<source_id>]]. Do not use [ or ] anywhere except inside "
-    "an exact copied citation_marker. Return only the required JSON object."
+    "evidence_sources. Return the recommended JSON form {\"content\":\"...\"}. "
+    "Do not use Markdown numeric citations such as [1], Chinese citation brackets "
+    "such as 【1】, combine multiple IDs in one marker, use an unknown ID, or emit "
+    "the literal placeholder [[cite:<source_id>]]. Do not use [ or ] anywhere "
+    "except inside an exact copied citation_marker. Return only the required JSON "
+    "object."
 )
 
 
@@ -200,6 +199,14 @@ def _response(citations: list[object], content: object) -> str:
     )
 
 
+def _content_response(content: object) -> str:
+    return json.dumps(
+        {"content": content},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
 _DEFAULT_RESPONSE = object()
 
 
@@ -210,10 +217,7 @@ class _Client:
         error: BaseException | None = None,
     ) -> None:
         self.response = (
-            _response(
-                ["evidence-source:000001"],
-                "Body [[cite:evidence-source:000001]]",
-            )
+            _content_response("Body [[cite:evidence-source:000001]]")
             if response is _DEFAULT_RESPONSE
             else response
         )
@@ -334,9 +338,8 @@ async def test_success_projects_canonical_prompt_and_returns_only_saved_ids(
 ) -> None:
     marker = "[[cite:evidence-source:000001]]"
     client = _Client(
-        _response(
-            ["evidence-source:000001"],
-            f"  Smith (2020) at www.example.test.\r\n{marker} and {marker}.  ",
+        _content_response(
+            f"  Smith (2020) at www.example.test.\r\n{marker} and {marker}.  "
         )
     )
     factory = _Factory(client)
@@ -425,10 +428,7 @@ async def test_bounded_response_retry_reuses_prompt_with_exact_suffix() -> None:
     first_raw = _response([], "FIRST-RAW-RESPONSE-SENTINEL")
     first = _Client(first_raw)
     second = _Client(
-        _response(
-            ["evidence-source:000001"],
-            "Second attempt body [[cite:evidence-source:000001]]",
-        )
+        _content_response("Second attempt body [[cite:evidence-source:000001]]")
     )
     factory = _Factory(clients=(first, second))
 
@@ -622,9 +622,7 @@ def _boundary_state(first_context: str) -> AcademicWorkflowState:
 @pytest.mark.asyncio
 async def test_prompt_65536_succeeds_and_adjacent_65537_rejects() -> None:
     marker = "[[cite:evidence-source:000001]]"
-    success_client = _Client(
-        _response(["evidence-source:000001"], f"Body {marker}")
-    )
+    success_client = _Client(_content_response(f"Body {marker}"))
     success_factory = _Factory(success_client)
     await _adapter(success_factory).write_section(
         _boundary_state(("\0" * 874) + ("\n" * 3) + ("A" * 3219)),
@@ -669,9 +667,7 @@ async def test_prompt_65536_succeeds_and_adjacent_65537_rejects() -> None:
         )
         for index in range(1, 4)
     )
-    joint_client = _Client(
-        _response(["evidence-source:000001"], f"Body {marker}")
-    )
+    joint_client = _Client(_content_response(f"Body {marker}"))
     joint_factory = _Factory(joint_client)
     await _adapter(joint_factory).write_section(
         _approved_state(
@@ -732,10 +728,15 @@ async def test_prompt_65536_succeeds_and_adjacent_65537_rejects() -> None:
         (
             ["evidence-source:000001", "evidence-source:000001"],
             "[[cite:evidence-source:000001]]",
-            False,
+            True,
         ),
         (
             ["evidence-source:999999"],
+            "[[cite:evidence-source:000001]]",
+            True,
+        ),
+        (
+            ["evidence-source:000001"],
             "[[cite:evidence-source:999999]]",
             False,
         ),
@@ -749,9 +750,9 @@ async def test_prompt_65536_succeeds_and_adjacent_65537_rejects() -> None:
         (
             ["evidence-source:000001", "evidence-source:000002"],
             "[[cite:evidence-source:000002]] [[cite:evidence-source:000001]]",
-            False,
+            True,
         ),
-        ([1], "Body", False),
+        ([1], "Body [[cite:evidence-source:000001]]", False),
     ],
 )
 async def test_citation_and_url_matrix_is_mechanical(
@@ -764,6 +765,16 @@ async def test_citation_and_url_matrix_is_mechanical(
     if valid:
         result = await _adapter(factory).write_section(_approved_state(), "section:000001")
         assert result.content == content
+        derived = module._extract_citations(
+            result.content,
+            ("evidence-source:000001", "evidence-source:000002"),
+        )
+        expected_derived = (
+            ("evidence-source:000002", "evidence-source:000001")
+            if content.startswith("[[cite:evidence-source:000002]]")
+            else ("evidence-source:000001",)
+        )
+        assert derived == expected_derived
     else:
         with pytest.raises(module._SectionWriterResponseError) as captured:
             await _adapter(factory).write_section(_approved_state(), "section:000001")
@@ -785,7 +796,22 @@ async def test_citation_and_url_matrix_is_mechanical(
         "",
         " \r\n\t ",
         "{" ,
-        '{"citations":[],"content":"Body","extra":1}',
+        '{"citations":[],"content":"Body [[cite:evidence-source:000001]]","extra":1}',
+        '{"citations":{},"content":"Body [[cite:evidence-source:000001]]"}',
+        json.dumps(
+            {
+                "citations": ["x"] * 65,
+                "content": "Body [[cite:evidence-source:000001]]",
+            },
+            separators=(",", ":"),
+        ),
+        json.dumps(
+            {
+                "citations": ["x" * 257],
+                "content": "Body [[cite:evidence-source:000001]]",
+            },
+            separators=(",", ":"),
+        ),
         "x" * 24577,
     ],
 )

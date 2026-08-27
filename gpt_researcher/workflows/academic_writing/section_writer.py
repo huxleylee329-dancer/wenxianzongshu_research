@@ -6,7 +6,7 @@ import asyncio
 import json
 from typing import Protocol
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from .state import (
     AcademicWorkflowState,
@@ -34,6 +34,7 @@ _SOURCE_TITLE_MAX_CHARS = 256
 _USER_MESSAGE_MAX_CHARS = 65536
 _RAW_RESPONSE_MAX_CHARS = 24576
 _CONTENT_MAX_CHARS = 24576
+_CITATION_VALUE_MAX_CHARS = 256
 _SECTION_MAX_TOKENS = 3072
 
 _SYSTEM_MESSAGE = (
@@ -51,22 +52,21 @@ _SYSTEM_MESSAGE = (
     "Chinese citation brackets such as 【1】, a marker containing multiple IDs, "
     "an unknown ID, or the literal placeholder [[cite:<source_id>]]. Do not use "
     "[ or ] anywhere except inside an exact copied citation_marker and do not "
-    "emit the literal substring ://. Return exactly one JSON object with the "
-    "keys citations and content. citations must be non-empty and exactly the "
-    "unique source IDs in first-marker order; content must contain only the "
-    "section body and its inline citation markers. Return no identifiers outside "
-    "citations, no code fence, comments, trailing prose, or extra keys. Write in "
-    "the requested language."
+    "emit the literal substring ://. Return exactly one JSON object in the "
+    "recommended form {\"content\":\"...\"}. content must contain only the "
+    "section body and its inline citation markers. Do not return a separate "
+    "citation plan, code fence, comments, trailing prose, or extra keys. Write "
+    "in the requested language."
 )
 _RETRY_SYSTEM_MESSAGE_SUFFIX = (
     " Your previous response was invalid. Return a non-empty content string "
     "containing at least one actual citation_marker copied exactly from "
-    "evidence_sources. The citations array must be non-empty and exactly equal "
-    "the unique source IDs in first-marker order. Do not use Markdown numeric "
-    "citations such as [1], Chinese citation brackets such as 【1】, combine "
-    "multiple IDs in one marker, use an unknown ID, or emit the literal "
-    "placeholder [[cite:<source_id>]]. Do not use [ or ] anywhere except inside "
-    "an exact copied citation_marker. Return only the required JSON object."
+    "evidence_sources. Return the recommended JSON form {\"content\":\"...\"}. "
+    "Do not use Markdown numeric citations such as [1], Chinese citation brackets "
+    "such as 【1】, combine multiple IDs in one marker, use an unknown ID, or emit "
+    "the literal placeholder [[cite:<source_id>]]. Do not use [ or ] anywhere "
+    "except inside an exact copied citation_marker. Return only the required JSON "
+    "object."
 )
 _RETRY_SYSTEM_MESSAGE = _SYSTEM_MESSAGE + _RETRY_SYSTEM_MESSAGE_SUFFIX
 
@@ -148,8 +148,37 @@ class _CompletionCallable(Protocol):
 class _SectionWriterResponse(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
-    citations: tuple[str, ...]
     content: str
+    citations: tuple[str, ...] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _require_exact_json_surface(cls, value: object) -> object:
+        if type(value) is not dict:
+            raise ValueError("section writer response must be an exact object")
+        keys = tuple(dict.__iter__(value))
+        if any(type(key) is not str for key in keys) or set(keys) not in (
+            {"content"},
+            {"content", "citations"},
+        ):
+            raise ValueError("section writer response fields are invalid")
+        content = dict.__getitem__(value, "content")
+        if type(content) is not str:
+            raise ValueError("section writer response content must be exact")
+        if "citations" in keys:
+            citations = dict.__getitem__(value, "citations")
+            if type(citations) is not list or len(citations) > _SOURCE_MAX_COUNT:
+                raise ValueError("section writer response citations are invalid")
+            for citation in list.__iter__(citations):
+                if (
+                    type(citation) is not str
+                    or len(citation) > _CITATION_VALUE_MAX_CHARS
+                ):
+                    raise ValueError("section writer response citation is invalid")
+            copied = dict(value)
+            copied["citations"] = tuple(citations)
+            return copied
+        return value
 
 
 class _SectionWriterExecutionError(RuntimeError):
@@ -688,23 +717,21 @@ def _parse_response(
         return _CONTRACT_FAILURE
     if content == "" or len(content) > _CONTENT_MAX_CHARS:
         return _RESPONSE_FAILURE
-    if not 1 <= len(citations) <= _SOURCE_MAX_COUNT:
-        return _RESPONSE_FAILURE
-    seen: set[str] = set()
-    for citation in citations:
-        if type(citation) is not str:
+    if citations is not None:
+        if type(citations) is not tuple or len(citations) > _SOURCE_MAX_COUNT:
             return _RESPONSE_FAILURE
-        if citation in seen or citation not in allowed_source_ids:
-            return _RESPONSE_FAILURE
-        seen.add(citation)
+        for citation in citations:
+            if (
+                type(citation) is not str
+                or len(citation) > _CITATION_VALUE_MAX_CHARS
+            ):
+                return _RESPONSE_FAILURE
     expected = _extract_citations(content, allowed_source_ids)
     if expected is _CONTRACT_FAILURE:
         return _CONTRACT_FAILURE
     if expected is _RESPONSE_FAILURE or type(expected) is not tuple:
         return _RESPONSE_FAILURE
     if not expected:
-        return _RESPONSE_FAILURE
-    if citations != expected:
         return _RESPONSE_FAILURE
     return content
 
