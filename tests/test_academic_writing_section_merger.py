@@ -531,7 +531,7 @@ def _boundary_state(
                 title=chr(64 + index) * 256,
                 url=f"https://example.test/{index}",
             )
-            for index in range(1, 25)
+            for index in range(1, 2)
         )
         if sources is None
         else sources
@@ -557,6 +557,7 @@ def _boundary_state(
 
 def _projected(source: WorkflowEvidenceSource) -> dict[str, str]:
     return {
+        "citation_marker": f"[[cite:{source.source_id}]]",
         "source_id": source.source_id,
         "title": source.title[:256],
         "url": source.url,
@@ -583,36 +584,37 @@ def _golden_vector(
             sources=sources,
             sections=(_section(1, title="s", brief="b"),),
         )
-        expected = [_projected(source) for source in sources[:24]]
+        expected = [_projected(source) for source in sources]
         return (
             state,
             expected,
-            2152,
-            "Body [[cite:evidence-source:000024]]",
-            ["evidence-source:000024"],
-            (("Body [[cite:evidence-source:000025]]", ["evidence-source:000025"]),),
+            3531,
+            "Body [[cite:evidence-source:000025]]",
+            ["evidence-source:000025"],
+            (),
         )
     if case in ("prompt_65536", "prompt_65537"):
         first = (
-            ("\0" * 952) + "\n" + ("A" * 3143)
+            ("\0" * 874) + ("\n" * 3) + ("A" * 3219)
             if case == "prompt_65536"
-            else ("\0" * 952) + ("\n" * 2) + ("A" * 3142)
+            else ("\0" * 874) + ("\n" * 4) + ("A" * 3218)
         )
         state = _boundary_state(first)
         if case == "prompt_65537":
             return state, None, None, "Body", [], ()
-        return state, [], 65536, "Body", [], ((f"Body {marker_1}", ["evidence-source:000001"]),)
+        source = state.research_evidence.sources[0]  # type: ignore[union-attr]
+        return state, [_projected(source)], 65536, f"Body {marker_1}", [source.source_id], ()
     if case in ("unicode_admit", "unicode_reject"):
         source = _source(1, title="é" * 257, url="https://example.test/1")
         first = (
-            ("\0" * 885) + ("A" * 3211)
+            ("\0" * 875) + ("A" * 3219)
             if case == "unicode_admit"
-            else ("\0" * 885) + "\n" + ("A" * 3210)
+            else ("\0" * 875) + "\n" + ("A" * 3218)
         )
         state = _boundary_state(first, sources=(source,))
         if case == "unicode_admit":
             return state, [_projected(source)], 65536, f"Body {marker_1}", [source.source_id], ()
-        return state, [], 65201, "Body", [], ((f"Body {marker_1}", [source.source_id]),)
+        return state, None, None, "Body", [], ()
     if case == "duplicate_title":
         sources = (
             _source(1, title="DUP", url="https://e.test/1"),
@@ -626,14 +628,14 @@ def _golden_vector(
         return (
             state,
             [_projected(source) for source in sources],
-            430,
+            534,
             body,
             [source.source_id for source in sources],
             (),
         )
     if case == "empty_sources":
         state = _approved_state(sections=(_section(1, title="s", brief="b"),))
-        return state, [], 275, "Body", [], ((f"Body {marker_1}", ["evidence-source:000001"]),)
+        return state, None, None, "Body", [], ()
     if case == "first_wins":
         long_url = "https://e.test/" + ("X" * 4081)
         sources = (
@@ -645,7 +647,7 @@ def _golden_vector(
             (f"Body [[cite:{source.source_id}]]", [source.source_id])
             for source in sources
         )
-        return state, [], 61400, "Body", [], rejected
+        return state, None, None, "Body", [], rejected
     raise AssertionError(case)  # pragma: no cover - test construction guard
 
 
@@ -668,13 +670,46 @@ async def test_public_35_oracle_and_merger_allowlists_match(case: str) -> None:
     client = _Client(_response(citations, body))
     factory = _Factory(client)
     adapter = GPTResearcherSectionWriterAdapter(section_writer_client_factory=factory)
-    if case == "prompt_65537":
-        with pytest.raises(ValueError):
+    if case in ("prompt_65537", "unicode_reject", "empty_sources", "first_wins"):
+        with pytest.raises(ValueError) as captured:
             await adapter.write_section(state, "section:000001")
         assert factory.calls == client.calls == 0
-        assert len(_canonical(_payload(state, []))) == 65537
-        with pytest.raises(module._SectionMergerError):
-            merge_sections(state, _draft_tuple_for_state(state))
+        expected_error = (
+            "academic section writer requires between 1 and 64 evidence sources"
+            if case == "empty_sources"
+            else "academic section writer user message exceeds 65536 characters"
+        )
+        assert type(captured.value) is ValueError
+        assert captured.value.args == (expected_error,)
+        assert captured.value.__cause__ is None
+        assert captured.value.__context__ is None
+        projected = [
+            _projected(source)
+            for source in state.research_evidence.sources  # type: ignore[union-attr]
+        ]
+        if case in ("prompt_65537", "unicode_reject"):
+            assert len(_canonical(_payload(state, projected))) == 65537
+        elif case == "first_wins":
+            sources = state.research_evidence.sources  # type: ignore[union-attr]
+            assert len(_canonical(_payload(state, []))) == 61400
+            assert len(_canonical(_payload(state, [_projected(sources[0])]))) == 65609
+            assert len(_canonical(_payload(state, [_projected(sources[1])]))) == 61529
+            assert len(_canonical(_payload(state, projected))) == 65739
+
+        merge_drafts = _draft_tuple_for_state(state, body)
+        merged = merge_sections(state, merge_drafts)
+        assert state.outline is not None
+        assert merged.content == "\n\n".join(
+            f"## {section.title}\n\n{draft.content}"
+            for section, draft in zip(
+                state.outline.sections, merge_drafts, strict=True
+            )
+        )
+        for rejected_body, _ in rejected:
+            with pytest.raises(module._SectionMergerError):
+                merge_sections(
+                    state, _draft_tuple_for_state(state, rejected_body)
+                )
         return
     await adapter.write_section(state, "section:000001")
     assert factory.calls == client.calls == 1
@@ -684,20 +719,71 @@ async def test_public_35_oracle_and_merger_allowlists_match(case: str) -> None:
     assert parsed["evidence_sources"] == expected_sources
     assert client.user_message == _canonical(parsed)
     merge_drafts = _draft_tuple_for_state(state, body)
-    merged = merge_sections(state, merge_drafts)
-    assert state.outline is not None
-    assert merged.content == "\n\n".join(
-        f"## {section.title}\n\n{draft.content}"
-        for section, draft in zip(state.outline.sections, merge_drafts, strict=True)
-    )
+    if case == "count_cutoff":
+        with pytest.raises(module._SectionMergerError):
+            merge_sections(state, merge_drafts)
+    else:
+        merged = merge_sections(state, merge_drafts)
+        assert state.outline is not None
+        assert merged.content == "\n\n".join(
+            f"## {section.title}\n\n{draft.content}"
+            for section, draft in zip(
+                state.outline.sections, merge_drafts, strict=True
+            )
+        )
+
+    if case == "count_cutoff":
+        assert len(parsed["evidence_sources"]) == 25
+        sources_64 = tuple(
+            _source(index, title="T", url=f"u{index}")
+            for index in range(1, 65)
+        )
+        state_64 = _approved_state(
+            sources=sources_64,
+            sections=(_section(1, title="s", brief="b"),),
+        )
+        client_64 = _Client(
+            _response(["evidence-source:000064"], "Body [[cite:evidence-source:000064]]")
+        )
+        factory_64 = _Factory(client_64)
+        await GPTResearcherSectionWriterAdapter(
+            section_writer_client_factory=factory_64
+        ).write_section(state_64, "section:000001")
+        assert factory_64.calls == client_64.calls == 1
+        assert type(client_64.user_message) is str
+        sources_payload_64 = json.loads(client_64.user_message)["evidence_sources"]
+        assert len(sources_payload_64) == 64
+        assert all(
+            source["citation_marker"] == f"[[cite:{source['source_id']}]]"
+            for source in sources_payload_64
+        )
+
+        sources_65 = (*sources_64, _source(65, title="T", url="u65"))
+        state_65 = _approved_state(
+            sources=sources_65,
+            sections=(_section(1, title="s", brief="b"),),
+        )
+        client_65 = _Client("unused")
+        factory_65 = _Factory(client_65)
+        with pytest.raises(ValueError) as captured_65:
+            await GPTResearcherSectionWriterAdapter(
+                section_writer_client_factory=factory_65
+            ).write_section(state_65, "section:000001")
+        assert type(captured_65.value) is ValueError
+        assert captured_65.value.args == (
+            "academic section writer requires between 1 and 64 evidence sources",
+        )
+        assert captured_65.value.__cause__ is None
+        assert captured_65.value.__context__ is None
+        assert factory_65.calls == client_65.calls == 0
 
     if case.startswith("unicode"):
         source = state.research_evidence.sources[0]  # type: ignore[union-attr]
         projected = _projected(source)
         base = len(_canonical(_payload(state, [])))
-        assert len(_canonical(_payload(state, [projected]))) == base + 336
-        assert len(_canonical(_payload(state, [{**projected, "title": "é" * 255}]))) == base + 335
-        assert len(_canonical(_payload(state, [{**projected, "title": "é" * 257}]))) == base + 337
+        assert len(_canonical(_payload(state, [projected]))) == base + 388
+        assert len(_canonical(_payload(state, [{**projected, "title": "é" * 255}]))) == base + 387
+        assert len(_canonical(_payload(state, [{**projected, "title": "é" * 257}]))) == base + 389
         assert len(
             json.dumps(
                 _payload(state, [projected]),
@@ -706,14 +792,8 @@ async def test_public_35_oracle_and_merger_allowlists_match(case: str) -> None:
                 sort_keys=True,
                 separators=(",", ":"),
             )
-        ) == base + 1616
-        assert len(_canonical(_payload(state, [{**projected, "title": "é" * 128}]))) == base + 208
-    if case == "first_wins":
-        sources = state.research_evidence.sources  # type: ignore[union-attr]
-        assert len(_canonical(_payload(state, []))) == 61400
-        assert len(_canonical(_payload(state, [_projected(sources[0])]))) == 65557
-        assert len(_canonical(_payload(state, [_projected(sources[1])]))) == 61477
-
+        ) == base + 1668
+        assert len(_canonical(_payload(state, [{**projected, "title": "é" * 128}]))) == base + 260
     for rejected_body, rejected_citations in rejected:
         rejected_client = _Client(_response(rejected_citations, rejected_body))
         rejected_factory = _Factory(rejected_client)

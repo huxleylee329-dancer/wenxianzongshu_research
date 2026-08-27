@@ -36,20 +36,29 @@ _SYSTEM_MESSAGE = (
     "full approved outline as scope context. Do not write another section, a "
     "new outline, a whole report, a reference list, or a replacement title. "
     "Use only facts supported by the supplied context_blocks and "
-    "evidence_sources. Cite a supplied source only with the exact inline marker "
-    "[[cite:<source_id>]], using an exact source_id from evidence_sources. Do "
-    "not use another citation syntax and do not emit the literal substring "
-    "://. Return exactly one JSON object with the keys citations and content. "
-    "citations must be the unique source IDs in first-marker order; content "
-    "must contain only the section body and its inline citation markers. Return "
-    "no identifiers outside citations, no code fence, comments, trailing prose, "
-    "or extra keys. Write in the requested language."
+    "evidence_sources. Each evidence_sources object contains citation_marker, "
+    "a complete allowed inline citation marker for that source. Copy at least "
+    "one actual citation_marker exactly into content, choosing only sources "
+    "that support the text. Do not use Markdown numeric citations such as [1], "
+    "Chinese citation brackets such as 【1】, a marker containing multiple IDs, "
+    "an unknown ID, or the literal placeholder [[cite:<source_id>]]. Do not use "
+    "[ or ] anywhere except inside an exact copied citation_marker and do not "
+    "emit the literal substring ://. Return exactly one JSON object with the "
+    "keys citations and content. citations must be non-empty and exactly the "
+    "unique source IDs in first-marker order; content must contain only the "
+    "section body and its inline citation markers. Return no identifiers outside "
+    "citations, no code fence, comments, trailing prose, or extra keys. Write in "
+    "the requested language."
 )
 _RETRY_SUFFIX = (
-    " Your previous response was invalid. Return a non-empty content string. "
-    "The citations array must exactly equal the unique source IDs in first-marker "
-    "order. Do not use [ or ] anywhere except inside an exact "
-    "[[cite:<source_id>]] marker. Return only the required JSON object."
+    " Your previous response was invalid. Return a non-empty content string "
+    "containing at least one actual citation_marker copied exactly from "
+    "evidence_sources. The citations array must be non-empty and exactly equal "
+    "the unique source IDs in first-marker order. Do not use Markdown numeric "
+    "citations such as [1], Chinese citation brackets such as 【1】, combine "
+    "multiple IDs in one marker, use an unknown ID, or emit the literal "
+    "placeholder [[cite:<source_id>]]. Do not use [ or ] anywhere except inside "
+    "an exact copied citation_marker. Return only the required JSON object."
 )
 
 
@@ -201,7 +210,12 @@ class _Client:
         error: BaseException | None = None,
     ) -> None:
         self.response = (
-            _response([], "Body") if response is _DEFAULT_RESPONSE else response
+            _response(
+                ["evidence-source:000001"],
+                "Body [[cite:evidence-source:000001]]",
+            )
+            if response is _DEFAULT_RESPONSE
+            else response
         )
         self.error = error
         self.calls = 0
@@ -310,7 +324,14 @@ def test_public_surface_and_all_frozen_signatures_are_exact() -> None:
 
 
 @pytest.mark.asyncio
-async def test_success_projects_canonical_prompt_and_returns_only_saved_ids() -> None:
+@pytest.mark.parametrize(
+    ("source_count", "valid"),
+    [(0, False), (1, True), (24, True), (25, True), (64, True), (65, False)],
+)
+async def test_success_projects_canonical_prompt_and_returns_only_saved_ids(
+    source_count: int,
+    valid: bool,
+) -> None:
     marker = "[[cite:evidence-source:000001]]"
     client = _Client(
         _response(
@@ -323,15 +344,27 @@ async def test_success_projects_canonical_prompt_and_returns_only_saved_ids() ->
         WorkflowEvidenceSource(
             source_id=f"evidence-source:{index:06d}",
             order=index,
-            title=chr(64 + index) * 300,
+            title="A" * 300,
             url=f"https://example.test/{index}",
             candidate_id=None,
         )
-        for index in range(1, 26)
+        for index in range(1, source_count + 1)
     )
     contexts = ("A" * 5000,) + tuple(f"block-{index}" for index in range(2, 11))
     state = _approved_state(context_blocks=contexts, sources=sources)
     before = state.model_dump(mode="json")
+
+    if not valid:
+        with pytest.raises(ValueError) as captured:
+            await _adapter(factory).write_section(state, "section:000002")
+        _assert_fixed(
+            captured.value,
+            ValueError,
+            "academic section writer requires between 1 and 64 evidence sources",
+        )
+        assert factory.calls == client.calls == 0
+        assert client.user_message is None
+        return
 
     draft = await _adapter(factory).write_section(state, "section:000002")
 
@@ -370,33 +403,42 @@ async def test_success_projects_canonical_prompt_and_returns_only_saved_ids() ->
         "section_id",
         "title",
     )
-    assert len(payload["evidence_sources"]) == 24
-    assert tuple(payload["evidence_sources"][0]) == ("source_id", "title", "url")
-    assert payload["evidence_sources"][0]["title"] == "A" * 256
-    assert payload["evidence_sources"][-1]["source_id"] == "evidence-source:000024"
-
-    excluded = _Client(
-        _response(
-            ["evidence-source:000025"],
-            "[[cite:evidence-source:000025]]",
-        )
+    assert len(payload["evidence_sources"]) == source_count
+    assert tuple(payload["evidence_sources"][0]) == (
+        "citation_marker",
+        "source_id",
+        "title",
+        "url",
     )
-    with pytest.raises(module._SectionWriterResponseError):
-        await _adapter(_Factory(excluded)).write_section(state, "section:000002")
+    assert payload["evidence_sources"][0]["title"] == "A" * 256
+    assert payload["evidence_sources"][-1]["source_id"] == (
+        f"evidence-source:{source_count:06d}"
+    )
+    assert all(
+        source["citation_marker"] == f"[[cite:{source['source_id']}]]"
+        for source in payload["evidence_sources"]
+    )
 
 
 @pytest.mark.asyncio
 async def test_bounded_response_retry_reuses_prompt_with_exact_suffix() -> None:
-    first_raw = "FIRST-RAW-RESPONSE-SENTINEL"
+    first_raw = _response([], "FIRST-RAW-RESPONSE-SENTINEL")
     first = _Client(first_raw)
-    second = _Client(_response([], "Second attempt body"))
+    second = _Client(
+        _response(
+            ["evidence-source:000001"],
+            "Second attempt body [[cite:evidence-source:000001]]",
+        )
+    )
     factory = _Factory(clients=(first, second))
 
     draft = await _adapter(factory).write_section(
         _approved_state(), "section:000001"
     )
 
-    assert draft.content == "Second attempt body"
+    assert draft.content == (
+        "Second attempt body [[cite:evidence-source:000001]]"
+    )
     assert factory.calls == 2
     assert first.calls == second.calls == 1
     assert factory.returned == [first, second]
@@ -555,7 +597,7 @@ def _boundary_state(first_context: str) -> AcademicWorkflowState:
             url=f"https://example.test/{index}",
             candidate_id=None,
         )
-        for index in range(1, 25)
+        for index in range(1, 2)
     )
     sections = tuple(
         WorkflowOutlineSection(
@@ -579,21 +621,26 @@ def _boundary_state(first_context: str) -> AcademicWorkflowState:
 
 @pytest.mark.asyncio
 async def test_prompt_65536_succeeds_and_adjacent_65537_rejects() -> None:
-    success_client = _Client(_response([], "Body"))
+    marker = "[[cite:evidence-source:000001]]"
+    success_client = _Client(
+        _response(["evidence-source:000001"], f"Body {marker}")
+    )
     success_factory = _Factory(success_client)
     await _adapter(success_factory).write_section(
-        _boundary_state(("\0" * 952) + "\n" + ("A" * 3143)),
+        _boundary_state(("\0" * 874) + ("\n" * 3) + ("A" * 3219)),
         "section:000001",
     )
     assert type(success_client.user_message) is str
     assert len(success_client.user_message) == 65536
-    assert json.loads(success_client.user_message)["evidence_sources"] == []
+    success_sources = json.loads(success_client.user_message)["evidence_sources"]
+    assert len(success_sources) == 1
+    assert success_sources[0]["citation_marker"] == marker
     assert success_factory.calls == success_client.calls == 1
 
     reject_factory = _Factory()
     with pytest.raises(ValueError) as captured:
         await _adapter(reject_factory).write_section(
-            _boundary_state(("\0" * 952) + ("\n" * 2) + ("A" * 3142)),
+            _boundary_state(("\0" * 874) + ("\n" * 4) + ("A" * 3218)),
             "section:000001",
         )
     _assert_fixed(
@@ -603,12 +650,57 @@ async def test_prompt_65536_succeeds_and_adjacent_65537_rejects() -> None:
     )
     assert reject_factory.calls == 0
 
+    joint_sources = tuple(
+        WorkflowEvidenceSource(
+            source_id=f"evidence-source:{index:06d}",
+            order=index,
+            title="T",
+            url=f"u{index}",
+            candidate_id=None,
+        )
+        for index in range(1, 65)
+    )
+    joint_sections = tuple(
+        WorkflowOutlineSection(
+            section_id=f"section:{index:06d}",
+            order=index,
+            title=chr(64 + index),
+            brief="B",
+        )
+        for index in range(1, 4)
+    )
+    joint_client = _Client(
+        _response(["evidence-source:000001"], f"Body {marker}")
+    )
+    joint_factory = _Factory(joint_client)
+    await _adapter(joint_factory).write_section(
+        _approved_state(
+            query="\0" * 4096,
+            language="L",
+            questions=("Q",),
+            context_blocks=("\0" * 4096, ("\0" * 906) + ("A" * 3190)),
+            sources=joint_sources,
+            sections=joint_sections,
+            outline_title="T",
+        ),
+        "section:000001",
+    )
+    assert type(joint_client.user_message) is str
+    assert len(joint_client.user_message) == 65536
+    joint_payload = json.loads(joint_client.user_message)
+    assert len(joint_payload["evidence_sources"]) == 64
+    assert all(
+        source["citation_marker"] == f"[[cite:{source['source_id']}]]"
+        for source in joint_payload["evidence_sources"]
+    )
+    assert joint_factory.calls == joint_client.calls == 1
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("citations", "content", "valid"),
     [
-        ([], "www.example.test and Smith (2020).", True),
+        ([], "www.example.test and Smith (2020).", False),
         (
             ["evidence-source:000001"],
             "A [[cite:evidence-source:000001]] B "
@@ -616,21 +708,44 @@ async def test_prompt_65536_succeeds_and_adjacent_65537_rejects() -> None:
             True,
         ),
         (["evidence-source:000001"], "[[cite:evidence-source:000001]", False),
-        ([], "[[cite:]]", False),
+        (["evidence-source:000001"], "[[cite:]]", False),
         (
             ["evidence-source:000001"],
             "[[cite:evidence-source:000001[[cite:x]]",
             False,
         ),
-        ([], "A [note].", False),
-        ([], "https://forbidden.test", False),
+        (
+            ["evidence-source:000001"],
+            "[1] [[cite:evidence-source:000001]]",
+            False,
+        ),
+        (
+            ["evidence-source:000001"],
+            "【1】 [[cite:evidence-source:000001]]",
+            False,
+        ),
+        (
+            ["evidence-source:000001"],
+            "https://forbidden.test [[cite:evidence-source:000001]]",
+            False,
+        ),
         (
             ["evidence-source:000001", "evidence-source:000001"],
             "[[cite:evidence-source:000001]]",
             False,
         ),
-        ([], "[[cite:evidence-source:000001]]", False),
+        (
+            ["evidence-source:999999"],
+            "[[cite:evidence-source:999999]]",
+            False,
+        ),
         (["evidence-source:000001"], "No marker.", False),
+        (
+            ["evidence-source:000001,evidence-source:000002"],
+            "[[cite:evidence-source:000001,evidence-source:000002]]",
+            False,
+        ),
+        (["<source_id>"], "[[cite:<source_id>]]", False),
         (
             ["evidence-source:000001", "evidence-source:000002"],
             "[[cite:evidence-source:000002]] [[cite:evidence-source:000001]]",
@@ -689,14 +804,17 @@ async def test_raw_response_failure_matrix(response: object) -> None:
 
 @pytest.mark.asyncio
 async def test_exact_raw_response_cap_is_reachable() -> None:
-    overhead = len(_response([], ""))
-    raw = _response([], "R" * (24576 - overhead))
+    source_id = "evidence-source:000001"
+    marker = f"[[cite:{source_id}]]"
+    overhead = len(_response([source_id], marker))
+    content = ("R" * (24576 - overhead)) + marker
+    raw = _response([source_id], content)
     assert len(raw) == 24576
     result = await _adapter(_Factory(_Client(raw))).write_section(
         _approved_state(),
         "section:000001",
     )
-    assert result.content == "R" * (24576 - overhead)
+    assert result.content == content
 
 
 @pytest.mark.asyncio
@@ -986,9 +1104,14 @@ async def test_injected_factory_never_touches_production_factory(
     assert default_adapter._section_writer_client_factory is forbidden
     assert "Config" not in module.__dict__
     assert "create_chat_completion" not in module.__dict__
-    client = _Client(_response([], "Body"))
+    client = _Client(
+        _response(
+            ["evidence-source:000001"],
+            "Body [[cite:evidence-source:000001]]",
+        )
+    )
     adapter = GPTResearcherSectionWriterAdapter(
         section_writer_client_factory=_Factory(client)
     )
     result = await adapter.write_section(_approved_state(), "section:000001")
-    assert result.content == "Body"
+    assert result.content == "Body [[cite:evidence-source:000001]]"

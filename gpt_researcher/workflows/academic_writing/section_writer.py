@@ -29,7 +29,7 @@ _QUESTION_TOTAL_MAX_CHARS = 1024
 _CONTEXT_MAX_COUNT = 8
 _CONTEXT_MAX_CHARS = 4096
 _CONTEXT_TOTAL_MAX_CHARS = 24576
-_SOURCE_MAX_COUNT = 24
+_SOURCE_MAX_COUNT = 64
 _SOURCE_TITLE_MAX_CHARS = 256
 _USER_MESSAGE_MAX_CHARS = 65536
 _RAW_RESPONSE_MAX_CHARS = 24576
@@ -44,20 +44,29 @@ _SYSTEM_MESSAGE = (
     "full approved outline as scope context. Do not write another section, a "
     "new outline, a whole report, a reference list, or a replacement title. "
     "Use only facts supported by the supplied context_blocks and "
-    "evidence_sources. Cite a supplied source only with the exact inline marker "
-    "[[cite:<source_id>]], using an exact source_id from evidence_sources. Do "
-    "not use another citation syntax and do not emit the literal substring "
-    "://. Return exactly one JSON object with the keys citations and content. "
-    "citations must be the unique source IDs in first-marker order; content "
-    "must contain only the section body and its inline citation markers. Return "
-    "no identifiers outside citations, no code fence, comments, trailing prose, "
-    "or extra keys. Write in the requested language."
+    "evidence_sources. Each evidence_sources object contains citation_marker, "
+    "a complete allowed inline citation marker for that source. Copy at least "
+    "one actual citation_marker exactly into content, choosing only sources "
+    "that support the text. Do not use Markdown numeric citations such as [1], "
+    "Chinese citation brackets such as 【1】, a marker containing multiple IDs, "
+    "an unknown ID, or the literal placeholder [[cite:<source_id>]]. Do not use "
+    "[ or ] anywhere except inside an exact copied citation_marker and do not "
+    "emit the literal substring ://. Return exactly one JSON object with the "
+    "keys citations and content. citations must be non-empty and exactly the "
+    "unique source IDs in first-marker order; content must contain only the "
+    "section body and its inline citation markers. Return no identifiers outside "
+    "citations, no code fence, comments, trailing prose, or extra keys. Write in "
+    "the requested language."
 )
 _RETRY_SYSTEM_MESSAGE_SUFFIX = (
-    " Your previous response was invalid. Return a non-empty content string. "
-    "The citations array must exactly equal the unique source IDs in first-marker "
-    "order. Do not use [ or ] anywhere except inside an exact "
-    "[[cite:<source_id>]] marker. Return only the required JSON object."
+    " Your previous response was invalid. Return a non-empty content string "
+    "containing at least one actual citation_marker copied exactly from "
+    "evidence_sources. The citations array must be non-empty and exactly equal "
+    "the unique source IDs in first-marker order. Do not use Markdown numeric "
+    "citations such as [1], Chinese citation brackets such as 【1】, combine "
+    "multiple IDs in one marker, use an unknown ID, or emit the literal "
+    "placeholder [[cite:<source_id>]]. Do not use [ or ] anywhere except inside "
+    "an exact copied citation_marker. Return only the required JSON object."
 )
 _RETRY_SYSTEM_MESSAGE = _SYSTEM_MESSAGE + _RETRY_SYSTEM_MESSAGE_SUFFIX
 
@@ -80,6 +89,9 @@ _QUESTION_LENGTH_ERROR = (
 )
 _QUESTION_TOTAL_ERROR = (
     "academic section writer research questions exceed 1024 characters"
+)
+_SOURCE_COUNT_ERROR = (
+    "academic section writer requires between 1 and 64 evidence sources"
 )
 _USER_MESSAGE_LENGTH_ERROR = (
     "academic section writer user message exceeds 65536 characters"
@@ -168,6 +180,7 @@ _LANGUAGE_LENGTH_FAILURE = _Marker()
 _QUESTION_COUNT_FAILURE = _Marker()
 _QUESTION_LENGTH_FAILURE = _Marker()
 _QUESTION_TOTAL_FAILURE = _Marker()
+_SOURCE_COUNT_FAILURE = _Marker()
 _USER_MESSAGE_LENGTH_FAILURE = _Marker()
 _EXECUTION_FAILURE = _Marker()
 _RESPONSE_FAILURE = _Marker()
@@ -492,19 +505,14 @@ def _project_user_message(
             "target_section_id": approved_section_id,
         }
         allowed_source_ids: list[str] = []
-        for source in evidence.sources[:_SOURCE_MAX_COUNT]:
+        for source in evidence.sources:
             candidate = {
+                "citation_marker": "[[cite:" + source.source_id + "]]",
                 "source_id": source.source_id,
                 "title": source.title[:_SOURCE_TITLE_MAX_CHARS],
                 "url": source.url,
             }
             projected_sources.append(candidate)
-            tentative = _canonical_json(payload)
-            if tentative is _CONTRACT_FAILURE:
-                return _CONTRACT_FAILURE
-            if len(tentative) > _USER_MESSAGE_MAX_CHARS:
-                projected_sources.pop()
-                break
             allowed_source_ids.append(source.source_id)
         encoded = _canonical_json(payload)
         if encoded is _CONTRACT_FAILURE or type(encoded) is not str:
@@ -559,6 +567,9 @@ def _prepare_attempt(
                 return _QUESTION_LENGTH_FAILURE
         if sum(len(question) for question in questions) > _QUESTION_TOTAL_MAX_CHARS:
             return _QUESTION_TOTAL_FAILURE
+        source_count = len(restored.research_evidence.sources)
+        if not 1 <= source_count <= _SOURCE_MAX_COUNT:
+            return _SOURCE_COUNT_FAILURE
         approved_outline_id = outline.outline_id
         approved_section_id = target_section.section_id
         if type(approved_outline_id) is not str or type(approved_section_id) is not str:
@@ -618,6 +629,8 @@ def _extract_citations(
     allowed_source_ids: tuple[str, ...],
 ) -> tuple[str, ...] | _Marker:
     try:
+        if "【" in content or "】" in content:
+            return _RESPONSE_FAILURE
         position = 0
         ordered: list[str] = []
         seen: set[str] = set()
@@ -675,7 +688,7 @@ def _parse_response(
         return _CONTRACT_FAILURE
     if content == "" or len(content) > _CONTENT_MAX_CHARS:
         return _RESPONSE_FAILURE
-    if len(citations) > _SOURCE_MAX_COUNT:
+    if not 1 <= len(citations) <= _SOURCE_MAX_COUNT:
         return _RESPONSE_FAILURE
     seen: set[str] = set()
     for citation in citations:
@@ -688,6 +701,8 @@ def _parse_response(
     if expected is _CONTRACT_FAILURE:
         return _CONTRACT_FAILURE
     if expected is _RESPONSE_FAILURE or type(expected) is not tuple:
+        return _RESPONSE_FAILURE
+    if not expected:
         return _RESPONSE_FAILURE
     if citations != expected:
         return _RESPONSE_FAILURE
@@ -833,6 +848,8 @@ def _finish_write_section(
         raise ValueError(_QUESTION_LENGTH_ERROR)
     if result is _QUESTION_TOTAL_FAILURE:
         raise ValueError(_QUESTION_TOTAL_ERROR)
+    if result is _SOURCE_COUNT_FAILURE:
+        raise ValueError(_SOURCE_COUNT_ERROR)
     if result is _USER_MESSAGE_LENGTH_FAILURE:
         raise ValueError(_USER_MESSAGE_LENGTH_ERROR)
     if result is _EXECUTION_FAILURE:
