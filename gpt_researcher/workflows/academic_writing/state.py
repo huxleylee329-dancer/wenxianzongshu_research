@@ -26,7 +26,11 @@ JsonValue: TypeAlias = (
     None | bool | int | str | list["JsonValue"] | dict[str, "JsonValue"]
 )
 NodeId: TypeAlias = Literal[
-    "topic_planner", "research_evidence", "outline_writer", "outline_approval"
+    "topic_planner",
+    "research_evidence",
+    "outline_writer",
+    "outline_approval",
+    "academic_draft_composer",
 ]
 OutlineDecision: TypeAlias = Literal["approve", "reject"]
 FailureCode: TypeAlias = Literal[
@@ -807,9 +811,16 @@ _OUTLINE_PAUSE = _EVIDENCE_SUCCESS + (
     ("node_started", "outline_writer"),
     ("node_completed", "outline_writer"),
 )
-_OUTLINE_APPROVED = _OUTLINE_PAUSE + (
+_OUTLINE_APPROVAL_SUCCESS = _OUTLINE_PAUSE + (
     ("node_started", "outline_approval"),
     ("node_completed", "outline_approval"),
+)
+_OUTLINE_APPROVED = _OUTLINE_APPROVAL_SUCCESS + (
+    ("workflow_completed", None),
+)
+_DRAFT_READY = _OUTLINE_APPROVAL_SUCCESS + (
+    ("node_started", "academic_draft_composer"),
+    ("node_completed", "academic_draft_composer"),
     ("workflow_completed", None),
 )
 _OUTLINE_REJECTED = _OUTLINE_PAUSE + (
@@ -831,6 +842,8 @@ class AcademicWorkflowState(_StrictWorkflowModel):
         "outline_ready",
         "outline_approved",
         "outline_rejected",
+        "draft_ready",
+        "review_required",
     ]
     status: Literal["running", "completed", "failed"]
     request: AcademicWorkflowRequest
@@ -915,6 +928,17 @@ class AcademicWorkflowState(_StrictWorkflowModel):
         elif shape == ("outline_approved", "completed"):
             expected_artifacts = (True, True, True)
             expected_events = _OUTLINE_APPROVED
+            expected_decision = "approve"
+        elif shape == ("outline_approved", "running"):
+            expected_artifacts = (True, True, True)
+            expected_events = _OUTLINE_APPROVAL_SUCCESS
+            expected_decision = "approve"
+        elif shape in (
+            ("draft_ready", "completed"),
+            ("review_required", "completed"),
+        ):
+            expected_artifacts = (True, True, True)
+            expected_events = _DRAFT_READY
             expected_decision = "approve"
         elif shape == ("outline_rejected", "completed"):
             expected_artifacts = (True, True, True)

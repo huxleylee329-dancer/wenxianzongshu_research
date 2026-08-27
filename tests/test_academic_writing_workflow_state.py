@@ -162,6 +162,12 @@ APPROVE_EVENTS = PAUSE_EVENTS + (
     _event(8, "node_completed", "outline_approval"),
     _event(9, "workflow_completed", None),
 )
+APPROVAL_RUNNING_EVENTS = APPROVE_EVENTS[:-1]
+COMPOSER_EVENTS = APPROVAL_RUNNING_EVENTS + (
+    _event(9, "node_started", "academic_draft_composer"),
+    _event(10, "node_completed", "academic_draft_composer"),
+    _event(11, "workflow_completed", None),
+)
 REJECT_EVENTS = PAUSE_EVENTS + (
     _event(7, "node_started", "outline_approval"),
     _event(8, "node_completed", "outline_approval"),
@@ -707,6 +713,33 @@ def test_all_reachable_phase_status_shapes_validate() -> None:
             events=APPROVE_EVENTS,
         ),
         _state(
+            phase="outline_approved",
+            status="running",
+            topic_plan=plan,
+            research_evidence=evidence,
+            outline=outline,
+            outline_decision=_decision("approve", outline),
+            events=APPROVAL_RUNNING_EVENTS,
+        ),
+        _state(
+            phase="draft_ready",
+            status="completed",
+            topic_plan=plan,
+            research_evidence=evidence,
+            outline=outline,
+            outline_decision=_decision("approve", outline),
+            events=COMPOSER_EVENTS,
+        ),
+        _state(
+            phase="review_required",
+            status="completed",
+            topic_plan=plan,
+            research_evidence=evidence,
+            outline=outline,
+            outline_decision=_decision("approve", outline),
+            events=COMPOSER_EVENTS,
+        ),
+        _state(
             phase="outline_rejected",
             status="completed",
             topic_plan=plan,
@@ -777,6 +810,9 @@ def test_all_reachable_phase_status_shapes_validate() -> None:
         "evidence_collected",
         "outline_ready",
         "outline_approved",
+        "outline_approved",
+        "draft_ready",
+        "review_required",
         "outline_rejected",
         "initialized",
         "topic_planned",
