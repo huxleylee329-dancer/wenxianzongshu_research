@@ -53,6 +53,13 @@ _SYSTEM_MESSAGE = (
     "no identifiers outside citations, no code fence, comments, trailing prose, "
     "or extra keys. Write in the requested language."
 )
+_RETRY_SYSTEM_MESSAGE_SUFFIX = (
+    " Your previous response was invalid. Return a non-empty content string. "
+    "The citations array must exactly equal the unique source IDs in first-marker "
+    "order. Do not use [ or ] anywhere except inside an exact "
+    "[[cite:<source_id>]] marker. Return only the required JSON object."
+)
+_RETRY_SYSTEM_MESSAGE = _SYSTEM_MESSAGE + _RETRY_SYSTEM_MESSAGE_SUFFIX
 
 _STATE_TYPE_ERROR = "academic section writer state must be an exact AcademicWorkflowState"
 _SECTION_TYPE_ERROR = "academic section writer section_id must be an exact string"
@@ -582,18 +589,20 @@ def _prepare_attempt(
 async def _call_client(
     factory: SectionWriterClientFactory,
     *,
+    system_message: str,
     user_message: str,
 ) -> object | _Marker:
     client: _SectionWriterClient | None = None
     try:
         client = factory()
         return await client.complete(
-            system_message=_SYSTEM_MESSAGE,
+            system_message=system_message,
             user_message=user_message,
         )
     except asyncio.CancelledError:
         del client
         del factory
+        del system_message
         del user_message
         raise
     except Exception:
@@ -736,7 +745,11 @@ async def _write_section_attempt(
     approved_outline_id, approved_section_id, user_message, allowed_source_ids = projection
     del projection
     try:
-        response = await _call_client(factory, user_message=user_message)
+        response = await _call_client(
+            factory,
+            system_message=_SYSTEM_MESSAGE,
+            user_message=user_message,
+        )
     except asyncio.CancelledError:
         del approved_outline_id
         del approved_section_id
@@ -744,14 +757,47 @@ async def _write_section_attempt(
         del allowed_source_ids
         del factory
         raise
-    del factory
-    del user_message
     if response is _EXECUTION_FAILURE:
+        del response
+        del factory
+        del user_message
+        del allowed_source_ids
+        del approved_outline_id
+        del approved_section_id
         return _EXECUTION_FAILURE
     parsed = _parse_response(response, allowed_source_ids=allowed_source_ids)
     del response
+    if parsed is _RESPONSE_FAILURE:
+        del parsed
+        try:
+            response = await _call_client(
+                factory,
+                system_message=_RETRY_SYSTEM_MESSAGE,
+                user_message=user_message,
+            )
+        except asyncio.CancelledError:
+            del approved_outline_id
+            del approved_section_id
+            del user_message
+            del allowed_source_ids
+            del factory
+            raise
+        if response is _EXECUTION_FAILURE:
+            del response
+            del factory
+            del user_message
+            del allowed_source_ids
+            del approved_outline_id
+            del approved_section_id
+            return _EXECUTION_FAILURE
+        parsed = _parse_response(response, allowed_source_ids=allowed_source_ids)
+        del response
+    del factory
+    del user_message
     del allowed_source_ids
     if type(parsed) is not str:
+        del approved_outline_id
+        del approved_section_id
         return parsed
     draft = _build_draft(approved_outline_id, approved_section_id, parsed)
     del approved_outline_id

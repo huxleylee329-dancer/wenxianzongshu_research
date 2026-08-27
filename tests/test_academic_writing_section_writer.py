@@ -45,6 +45,12 @@ _SYSTEM_MESSAGE = (
     "no identifiers outside citations, no code fence, comments, trailing prose, "
     "or extra keys. Write in the requested language."
 )
+_RETRY_SUFFIX = (
+    " Your previous response was invalid. Return a non-empty content string. "
+    "The citations array must exactly equal the unique source IDs in first-marker "
+    "order. Do not use [ or ] anywhere except inside an exact "
+    "[[cite:<source_id>]] marker. Return only the required JSON object."
+)
 
 
 def _event(order: int, event_type: str, node_id: str | None) -> WorkflowEvent:
@@ -212,16 +218,31 @@ class _Client:
 
 
 class _Factory:
-    def __init__(self, client: _Client | None = None, error: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        client: _Client | None = None,
+        error: BaseException | None = None,
+        *,
+        clients: tuple[_Client, ...] | None = None,
+    ) -> None:
         self.client = _Client() if client is None else client
+        self.clients = None if clients is None else deque(clients)
         self.error = error
         self.calls = 0
+        self.returned: list[_Client] = []
 
     def __call__(self) -> _Client:
         self.calls += 1
         if self.error is not None:
             raise self.error
-        return self.client
+        if self.clients is not None:
+            if not self.clients:
+                raise AssertionError("unexpected third factory call")
+            selected = self.clients.popleft()
+        else:
+            selected = self.client
+        self.returned.append(selected)
+        return selected
 
 
 def _adapter(factory: _Factory) -> GPTResearcherSectionWriterAdapter:
@@ -362,6 +383,29 @@ async def test_success_projects_canonical_prompt_and_returns_only_saved_ids() ->
     )
     with pytest.raises(module._SectionWriterResponseError):
         await _adapter(_Factory(excluded)).write_section(state, "section:000002")
+
+
+@pytest.mark.asyncio
+async def test_bounded_response_retry_reuses_prompt_with_exact_suffix() -> None:
+    first_raw = "FIRST-RAW-RESPONSE-SENTINEL"
+    first = _Client(first_raw)
+    second = _Client(_response([], "Second attempt body"))
+    factory = _Factory(clients=(first, second))
+
+    draft = await _adapter(factory).write_section(
+        _approved_state(), "section:000001"
+    )
+
+    assert draft.content == "Second attempt body"
+    assert factory.calls == 2
+    assert first.calls == second.calls == 1
+    assert factory.returned == [first, second]
+    assert first is not second
+    assert first.system_message == _SYSTEM_MESSAGE
+    assert second.system_message == _SYSTEM_MESSAGE + _RETRY_SUFFIX
+    assert first.user_message is second.user_message
+    assert first_raw not in second.system_message
+    assert first_raw not in second.user_message
 
 
 @pytest.mark.asyncio
@@ -613,7 +657,8 @@ async def test_citation_and_url_matrix_is_mechanical(
             module._SectionWriterResponseError,
             "section writer response invalid",
         )
-    assert factory.calls == client.calls == 1
+    expected_calls = 1 if valid else 2
+    assert factory.calls == client.calls == expected_calls
 
 
 @pytest.mark.asyncio
@@ -631,13 +676,15 @@ async def test_citation_and_url_matrix_is_mechanical(
 )
 async def test_raw_response_failure_matrix(response: object) -> None:
     client = _Client(response=response)
+    factory = _Factory(client)
     with pytest.raises(module._SectionWriterResponseError) as captured:
-        await _adapter(_Factory(client)).write_section(_approved_state(), "section:000001")
+        await _adapter(factory).write_section(_approved_state(), "section:000001")
     _assert_fixed(
         captured.value,
         module._SectionWriterResponseError,
         "section writer response invalid",
     )
+    assert factory.calls == client.calls == 2
 
 
 @pytest.mark.asyncio
@@ -680,13 +727,101 @@ async def test_execution_contract_and_cancellation_classes_are_distinct(
         module._SectionWriterContractError,
         "section writer adapter contract violation",
     )
+    monkeypatch.undo()
 
     cancelled = asyncio.CancelledError()
+    cancellation_state = _approved_state()
     client = _Client(error=cancelled)
+    cancellation_factory = _Factory(client)
     with pytest.raises(asyncio.CancelledError) as cancellation:
-        await _adapter(_Factory(client)).write_section(_approved_state(), "section:000001")
+        await _adapter(cancellation_factory).write_section(
+            cancellation_state, "section:000001"
+        )
     assert cancellation.value is cancelled
     assert client.calls == 1
+    for sensitive in (
+        cancellation_state,
+        cancellation_factory,
+        client,
+        client.response,
+        client.user_message,
+    ):
+        assert not _reachable(cancellation.value, sensitive)
+
+    first = _Client("invalid first response")
+    execution_client = _Client(error=RuntimeError("second execution secret"))
+    execution_factory = _Factory(clients=(first, execution_client))
+    with pytest.raises(module._SectionWriterExecutionError) as captured:
+        await _adapter(execution_factory).write_section(
+            _approved_state(), "section:000001"
+        )
+    _assert_fixed(
+        captured.value,
+        module._SectionWriterExecutionError,
+        "section writer execution failed",
+    )
+    assert execution_factory.calls == 2
+    assert first.calls == execution_client.calls == 1
+
+    second_cancelled = asyncio.CancelledError("second cancellation")
+    cancellation_first = _Client("invalid first response")
+    cancellation_client = _Client(error=second_cancelled)
+    cancellation_factory = _Factory(
+        clients=(cancellation_first, cancellation_client)
+    )
+    cancellation_state = _approved_state()
+    with pytest.raises(asyncio.CancelledError) as cancellation:
+        await _adapter(cancellation_factory).write_section(
+            cancellation_state, "section:000001"
+        )
+    assert cancellation.value is second_cancelled
+    assert cancellation.value.args == ("second cancellation",)
+    assert cancellation_factory.calls == 2
+    assert cancellation_first.calls == cancellation_client.calls == 1
+    for sensitive in (
+        cancellation_state,
+        cancellation_factory,
+        cancellation_first,
+        cancellation_client,
+        cancellation_first.response,
+        cancellation_client.response,
+        cancellation_first.user_message,
+        cancellation_client.user_message,
+    ):
+        assert not _reachable(cancellation.value, sensitive)
+
+    parser_calls = 0
+
+    def second_parser_contract_failure(
+        _value: object, *, allowed_source_ids: tuple[str, ...]
+    ) -> object:
+        nonlocal parser_calls
+        parser_calls += 1
+        assert allowed_source_ids == (
+            "evidence-source:000001",
+            "evidence-source:000002",
+        )
+        if parser_calls == 1:
+            return module._RESPONSE_FAILURE
+        return module._CONTRACT_FAILURE
+
+    monkeypatch.setattr(module, "_parse_response", second_parser_contract_failure)
+    first_contract_client = _Client("first")
+    second_contract_client = _Client("second")
+    contract_factory = _Factory(
+        clients=(first_contract_client, second_contract_client)
+    )
+    with pytest.raises(module._SectionWriterContractError) as captured:
+        await _adapter(contract_factory).write_section(
+            _approved_state(), "section:000001"
+        )
+    _assert_fixed(
+        captured.value,
+        module._SectionWriterContractError,
+        "section writer adapter contract violation",
+    )
+    assert contract_factory.calls == parser_calls == 2
+    assert first_contract_client.calls == second_contract_client.calls == 1
 
 
 class _Config:
@@ -799,13 +934,44 @@ def _reachable(root: BaseException, target: object) -> bool:
 async def test_fixed_execution_error_drops_sensitive_inputs_client_and_prompt() -> None:
     sentinel = object()
     state = _approved_state()
-    client = _Client(error=RuntimeError("sensitive"))
-    client.sentinel = sentinel
-    factory = _Factory(client)
+    first_raw = "FIRST-RESPONSE-REACHABILITY-SENTINEL"
+    first_client = _Client(first_raw)
+    second_client = _Client(error=RuntimeError("sensitive"))
+    second_client.sentinel = sentinel
+    factory = _Factory(clients=(first_client, second_client))
     with pytest.raises(module._SectionWriterExecutionError) as captured:
         await _adapter(factory).write_section(state, "section:000001")
-    for sensitive in (sentinel, state, client, factory, client.user_message):
+    assert factory.calls == 2
+    for sensitive in (
+        sentinel,
+        state,
+        first_raw,
+        first_client,
+        second_client,
+        factory,
+        first_client.user_message,
+        second_client.user_message,
+    ):
         assert not _reachable(captured.value, sensitive)
+
+    first_invalid = _Client("FIRST-INVALID-RAW")
+    second_invalid = _Client("SECOND-INVALID-RAW")
+    response_factory = _Factory(clients=(first_invalid, second_invalid))
+    with pytest.raises(module._SectionWriterResponseError) as response_error:
+        await _adapter(response_factory).write_section(
+            _approved_state(), "section:000001"
+        )
+    assert response_factory.calls == 2
+    for sensitive in (
+        first_invalid,
+        second_invalid,
+        response_factory,
+        first_invalid.response,
+        second_invalid.response,
+        first_invalid.user_message,
+        second_invalid.user_message,
+    ):
+        assert not _reachable(response_error.value, sensitive)
 
 
 @pytest.mark.asyncio
