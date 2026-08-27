@@ -103,7 +103,7 @@ If the second response returns `_RESPONSE_FAILURE`, raise the existing
 cause and context. If the second factory/completion fails, preserve the existing
 `_SectionWriterExecutionError("section writer execution failed")`; there is no
 third call. If the second response produces `_CONTRACT_FAILURE`, preserve the
-existing `_SectionWriterContractError("section writer contract invalid")`.
+existing `_SectionWriterContractError("section writer adapter contract violation")`.
 
 ## 7. Bounds and cost semantics
 
