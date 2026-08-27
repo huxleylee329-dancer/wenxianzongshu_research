@@ -1,0 +1,7 @@
+json5
+langgraph>=1.2.11,<2
+json5
+langgraph-cli
+loguru
+python-dotenv
+weasyprint
