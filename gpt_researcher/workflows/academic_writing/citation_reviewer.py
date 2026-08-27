@@ -53,7 +53,7 @@ _PROVENANCE_BLOCK_MAX_COUNT = 64
 _PROVENANCE_BLOCK_MAX_CHARS = 16384
 _PROVENANCE_TOTAL_MAX_CHARS = 262144
 _SECTION_CONTENT_MAX_CHARS = 24576
-_USER_MESSAGE_MAX_CHARS = 65536
+_USER_MESSAGE_MAX_BYTES = 65536
 _RAW_RESPONSE_MAX_CHARS = 24576
 _RATIONALE_MAX_CHARS = 2048
 _CITATION_REVIEWER_MAX_TOKENS = 3072
@@ -774,6 +774,139 @@ def _canonical_user_message(payload: object) -> str | _Marker:
         return _CONTRACT_FAILURE
 
 
+def _first_nonblank_prefix(value: str) -> str | _Marker:
+    try:
+        for end in range(1, len(value) + 1):
+            prefix = value[:end]
+            if prefix.strip():
+                return prefix
+        return _CONTRACT_FAILURE
+    except Exception:
+        return _CONTRACT_FAILURE
+
+
+def _message_size(value: str) -> int | _Marker:
+    try:
+        return len(value.encode("utf-8"))
+    except Exception:
+        return _CONTRACT_FAILURE
+
+
+def _project_review_message(
+    *,
+    section_id: str,
+    cited_source_ids: tuple[str, ...],
+    section_content: str,
+    provenance: dict[str, tuple[str, ...]],
+) -> str | _Marker:
+    try:
+        ordered_ids: list[str] = []
+        seen: set[str] = set()
+        for source_id in cited_source_ids:
+            if source_id not in seen:
+                seen.add(source_id)
+                ordered_ids.append(source_id)
+        if not ordered_ids:
+            return _CONTRACT_FAILURE
+
+        evidence_records: list[dict[str, object]] = []
+        source_blocks: list[tuple[str, ...]] = []
+        minimum_lengths: list[int] = []
+        for source_id in ordered_ids:
+            if source_id not in provenance:
+                return _CONTRACT_FAILURE
+            blocks = dict.__getitem__(provenance, source_id)
+            if type(blocks) is not tuple or not blocks:
+                return _CONTRACT_FAILURE
+            first_block = tuple.__getitem__(blocks, 0)
+            if type(first_block) is not str:
+                return _CONTRACT_FAILURE
+            minimum = _first_nonblank_prefix(first_block)
+            if type(minimum) is not str:
+                return _CONTRACT_FAILURE
+            evidence_records.append(
+                {
+                    "source_id": source_id,
+                    "evidence_blocks": [minimum],
+                }
+            )
+            source_blocks.append(blocks)
+            minimum_lengths.append(len(minimum))
+
+        payload = {
+            "cited_source_ids": list(ordered_ids),
+            "evidence_by_source": evidence_records,
+            "section_content": section_content,
+            "section_id": section_id,
+        }
+        encoded = _canonical_user_message(payload)
+        if type(encoded) is not str:
+            return _CONTRACT_FAILURE
+        size = _message_size(encoded)
+        if type(size) is not int or size > _USER_MESSAGE_MAX_BYTES:
+            return _CONTRACT_FAILURE
+
+        for source_index in range(len(source_blocks)):
+            blocks = source_blocks[source_index]
+            record = evidence_records[source_index]
+            projected = dict.__getitem__(record, "evidence_blocks")
+            if type(projected) is not list:
+                return _CONTRACT_FAILURE
+            for block_index in range(len(blocks)):
+                block = tuple.__getitem__(blocks, block_index)
+                if type(block) is not str:
+                    return _CONTRACT_FAILURE
+                lower = minimum_lengths[source_index] if block_index == 0 else 0
+                if block_index == 0:
+                    list.__setitem__(projected, 0, block)
+                else:
+                    list.append(projected, block)
+                candidate = _canonical_user_message(payload)
+                candidate_size = (
+                    _message_size(candidate) if type(candidate) is str else _CONTRACT_FAILURE
+                )
+                if type(candidate_size) is int and candidate_size <= _USER_MESSAGE_MAX_BYTES:
+                    encoded = candidate
+                    continue
+
+                if block_index == 0:
+                    list.__setitem__(projected, 0, block[:lower])
+                else:
+                    list.pop(projected)
+                upper = len(block)
+                while lower < upper:
+                    middle = (lower + upper + 1) // 2
+                    prefix = block[:middle]
+                    if block_index == 0:
+                        list.__setitem__(projected, 0, prefix)
+                    else:
+                        list.append(projected, prefix)
+                    candidate = _canonical_user_message(payload)
+                    candidate_size = (
+                        _message_size(candidate)
+                        if type(candidate) is str
+                        else _CONTRACT_FAILURE
+                    )
+                    if block_index != 0:
+                        list.pop(projected)
+                    if (
+                        type(candidate_size) is int
+                        and candidate_size <= _USER_MESSAGE_MAX_BYTES
+                    ):
+                        lower = middle
+                        encoded = candidate
+                    else:
+                        upper = middle - 1
+                if block_index == 0:
+                    list.__setitem__(projected, 0, block[:lower])
+                elif lower:
+                    list.append(projected, block[:lower])
+                return encoded
+        return encoded
+    except Exception:
+        return _CONTRACT_FAILURE
+
+
 def _same_gate_projection(
     left: tuple[str, tuple[str, ...], tuple[tuple[str, ...], ...], int],
     right: tuple[str, tuple[str, ...], tuple[tuple[str, ...], ...], int],
@@ -831,29 +964,18 @@ def _prepare_review_plan(
             )
             if type(content) is not str:
                 return _PREFLIGHT_FAILURE
-            evidence_records: list[dict[str, object]] = []
             for source_index in range(tuple.__len__(cited_ids)):
                 source_id = tuple.__getitem__(cited_ids, source_index)
                 if type(source_id) is not str or source_id not in provenance:
                     return _PREFLIGHT_FAILURE
-                blocks = dict.__getitem__(provenance, source_id)
-                evidence_records.append(
-                    {
-                        "source_id": source_id,
-                        "evidence_blocks": list(blocks),
-                    }
-                )
-            payload = {
-                "cited_source_ids": list(cited_ids),
-                "evidence_by_source": evidence_records,
-                "section_content": content,
-                "section_id": section_id,
-            }
-            user_message = _canonical_user_message(payload)
-            del payload
-            del evidence_records
+            user_message = _project_review_message(
+                section_id=section_id,
+                cited_source_ids=cited_ids,
+                section_content=content,
+                provenance=provenance,
+            )
             del content
-            if type(user_message) is not str or len(user_message) > _USER_MESSAGE_MAX_CHARS:
+            if type(user_message) is not str:
                 return _PREFLIGHT_FAILURE
             sections.append((section_id, tuple(cited_ids), user_message))
         del drafts

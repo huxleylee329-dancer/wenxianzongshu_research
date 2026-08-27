@@ -592,10 +592,78 @@ async def test_prompt_is_canonical_partitioned_and_current_section_only() -> Non
     )
     assert "S2" not in first
 
+    large_provenance = tuple(
+        WorkflowEvidenceProvenance(
+            source_id=f"evidence-source:{order:06d}",
+            evidence_blocks=("甲" * 8192, "乙" * 8192),
+        )
+        for order in range(1, 5)
+    )
+    large_state = _state(
+        source_count=4,
+        provenance=large_provenance,
+    )
+    large_content = " ".join(
+        f"[[cite:evidence-source:{order:06d}]]" for order in range(1, 5)
+    )
+    large_drafts = _drafts(1, large_content)
+    large_gate = gate_citation_evidence(large_state, large_drafts)
+    full_payload = {
+        "cited_source_ids": list(large_gate.cited_source_ids_by_section[0]),
+        "evidence_by_source": [
+            {
+                "source_id": entry.source_id,
+                "evidence_blocks": list(entry.evidence_blocks),
+            }
+            for entry in large_provenance
+        ],
+        "section_content": large_content,
+        "section_id": "section:000001",
+    }
+    assert len(
+        json.dumps(
+            full_payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ) > 65536
+
+    large_factory = _Factory(None)
+    large_result = await GPTResearcherCitationReviewerAdapter(
+        citation_reviewer_client_factory=large_factory
+    ).review_citations(large_state, large_drafts, large_gate)
+    assert len(large_result) == 1
+    assert large_factory.count == len(large_factory.calls) == 1
+    projected_message = large_factory.calls[0][2]
+    assert len(projected_message.encode("utf-8")) <= 65536
+    projected_payload = json.loads(projected_message)
+    cited_ids = [entry.source_id for entry in large_provenance]
+    assert projected_payload["cited_source_ids"] == cited_ids
+    assert [
+        record["source_id"] for record in projected_payload["evidence_by_source"]
+    ] == cited_ids
+    for original, projected in zip(
+        large_provenance,
+        projected_payload["evidence_by_source"],
+        strict=True,
+    ):
+        projected_blocks = projected["evidence_blocks"]
+        assert 1 <= len(projected_blocks) <= len(original.evidence_blocks)
+        for index, projected_block in enumerate(projected_blocks):
+            assert projected_block.strip()
+            assert original.evidence_blocks[index].startswith(projected_block)
+            if index < len(projected_blocks) - 1:
+                assert projected_block == original.evidence_blocks[index]
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("length", (65536, 65537))
-async def test_prompt_adjacent_boundary(length: int) -> None:
+async def test_prompt_adjacent_boundary(
+    length: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     marker = "[[cite:evidence-source:000001]]"
     content = marker + ("C" * (24576 - len(marker)))
     block = ("\0" * 4878) + ("\n" * (3 if length == 65536 else 4))
@@ -607,16 +675,33 @@ async def test_prompt_adjacent_boundary(length: int) -> None:
     adapter = GPTResearcherCitationReviewerAdapter(
         citation_reviewer_client_factory=factory
     )
+    result = await adapter.review_citations(state, drafts, gate)
+    assert len(result) == 1
+    assert factory.count == len(factory.calls) == 1
+    user_message = factory.calls[0][2]
+    assert len(user_message.encode("utf-8")) <= 65536
+    projected = json.loads(user_message)
+    assert projected["cited_source_ids"] == ["evidence-source:000001"]
+    assert [
+        record["source_id"] for record in projected["evidence_by_source"]
+    ] == ["evidence-source:000001"]
+    projected_block = projected["evidence_by_source"][0]["evidence_blocks"][0]
+    assert projected_block.strip()
+    assert block.startswith(projected_block)
     if length == 65536:
-        result = await adapter.review_citations(state, drafts, gate)
-        assert len(result) == 1
-        assert len(factory.calls[0][2]) == 65536
-        assert factory.count == 1
+        assert len(user_message.encode("utf-8")) == 65536
+        assert projected_block == block
     else:
+        assert projected_block != block
+        monkeypatch.setattr(module, "_USER_MESSAGE_MAX_BYTES", 1)
+        impossible_factory = _Factory(None)
         with pytest.raises(module._CitationReviewerError) as caught:
-            await adapter.review_citations(state, drafts, gate)
+            await GPTResearcherCitationReviewerAdapter(
+                citation_reviewer_client_factory=impossible_factory
+            ).review_citations(state, drafts, gate)
         _assert_fixed(caught.value)
-        assert factory.count == 0
+        assert impossible_factory.count == 0
+        assert impossible_factory.calls == []
 
 
 @pytest.mark.asyncio
