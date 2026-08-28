@@ -915,6 +915,7 @@ const GPTResearcher = (() => {
       academicRevisionUsed = Boolean(data.revision_used);
       setAcademicBusy(false);
       isResearchActive = false;
+      lastRequestData = null;
       updateResearchIcon(false);
       updateAcademicStage('human_review');
       outlinePanel.hidden = true;
@@ -939,6 +940,7 @@ const GPTResearcher = (() => {
       if (data.session_id) academicSessionId = data.session_id;
       setAcademicBusy(false);
       isResearchActive = false;
+      lastRequestData = null;
       updateAcademicStage('complete');
       updateResearchIcon(false);
       outlinePanel.hidden = true;
@@ -957,6 +959,7 @@ const GPTResearcher = (() => {
     } else if (data.type === 'academic_error') {
       setAcademicBusy(false);
       isResearchActive = false;
+      lastRequestData = null;
       updateResearchIcon(false);
       addAgentResponse({ output: `Academic workflow error: ${data.code || 'internal_error'}` });
       updateState('error');
@@ -980,6 +983,13 @@ const GPTResearcher = (() => {
     document.getElementById('output').innerHTML = ''
     document.getElementById('reportContainer').innerHTML = ''
     dispose_socket?.() // Call previous dispose function if it exists
+    dispose_socket = null
+
+    // A user-triggered submission is always a new run. Do not let request
+    // metadata from the previous completed run make the new socket look like
+    // a reconnect of that run.
+    lastRequestData = null
+    reconnectAttempts = 0
 
     // Reset report variables
     allReports = '';
@@ -1019,10 +1029,10 @@ const GPTResearcher = (() => {
         });
     }
 
-    dispose_socket = listenToSockEvents() // Assign the new dispose function
+    dispose_socket = listenToSockEvents({ isReconnect: false }) // Assign the new dispose function
   }
 
-  const listenToSockEvents = () => {
+  const listenToSockEvents = ({ isReconnect = false } = {}) => {
     const { protocol, host, pathname } = window.location
     const ws_uri = `${protocol === 'https:' ? 'wss:' : 'ws:'
       }//${host}${pathname}ws`
@@ -1053,11 +1063,13 @@ const GPTResearcher = (() => {
     // Update WebSocket status
     updateWebSocketStatus();
 
-    socket = new WebSocket(ws_uri)
+    let intentionallyClosed = false;
+    const connectionSocket = new WebSocket(ws_uri)
+    socket = connectionSocket
     let reportContent = ''; // Store the report content for history
     let downloadLinkData = null; // Store download links
 
-    socket.onmessage = (event) => {
+    connectionSocket.onmessage = (event) => {
       // Reset reconnect attempts on successful message
       reconnectAttempts = 0;
 
@@ -1106,6 +1118,7 @@ const GPTResearcher = (() => {
         updateState('finished')
         downloadLinkData = updateDownloadLink(data)
         isResearchActive = false;
+        lastRequestData = null;
 
         // Get the current report_type
         const report_type = document.querySelector('select[name="report_type"]').value;
@@ -1144,7 +1157,7 @@ const GPTResearcher = (() => {
       }
     }
 
-    socket.onopen = (event) => {
+    connectionSocket.onopen = (event) => {
       // Clear the connection timeout
       clearTimeout(connectionTimeout);
 
@@ -1159,8 +1172,10 @@ const GPTResearcher = (() => {
       // Ensure the research icon is spinning when connection is established
       updateResearchIcon(true);
 
-      // If this is a reconnection and we're in research mode, don't send a new start command
-      if (isResearchActive && lastRequestData) {
+      // Reconnect sockets attach to an already-started run. New-run sockets
+      // must always send the freshly selected request, even when the previous
+      // run left metadata behind.
+      if (isReconnect) {
         console.log("Reconnected during active research, not sending new start command");
         return;
       }
@@ -1177,7 +1192,7 @@ const GPTResearcher = (() => {
         };
         lastRequestData = requestData;
         setAcademicBusy(true);
-        socket.send(`academic_start ${JSON.stringify(requestData)}`);
+        connectionSocket.send(`academic_start ${JSON.stringify(requestData)}`);
         return;
       }
       const report_source = document.querySelector(
@@ -1220,10 +1235,14 @@ const GPTResearcher = (() => {
       // Store the request data for potential reconnection
       lastRequestData = requestData;
 
-      socket.send(`start ${JSON.stringify(requestData)}`)
+      connectionSocket.send(`start ${JSON.stringify(requestData)}`)
     }
 
-    socket.onclose = (event) => {
+    connectionSocket.onclose = (event) => {
+      // Closing the previous run's socket is part of starting a new run. Its
+      // delayed close event must not create a competing reconnect socket.
+      if (intentionallyClosed) return;
+
       // Update metrics and status when connection closes
       connectionStartTime = null;
       updateWebSocketStatus();
@@ -1236,7 +1255,7 @@ const GPTResearcher = (() => {
       }
     }
 
-    socket.onerror = (error) => {
+    connectionSocket.onerror = (error) => {
       console.error("WebSocket error:", error);
       updateWebSocketStatus();
     }
@@ -1244,10 +1263,12 @@ const GPTResearcher = (() => {
     // return dispose function
     return () => {
       try {
+        intentionallyClosed = true;
         isResearchActive = false; // Mark research as inactive
-        if (socket && socket.readyState !== WebSocket.CLOSED && socket.readyState !== WebSocket.CLOSING) {
-          socket.close();
+        if (connectionSocket.readyState !== WebSocket.CLOSED && connectionSocket.readyState !== WebSocket.CLOSING) {
+          connectionSocket.close();
         }
+        if (socket === connectionSocket) socket = null;
 
         // Update metrics on socket disposal
         connectionStartTime = null;
@@ -2076,6 +2097,14 @@ const GPTResearcher = (() => {
     if (reconnectAttempts >= maxReconnectAttempts) {
       console.error(`Failed to reconnect after ${maxReconnectAttempts} attempts`);
       addChatMessage(`Unable to reconnect after ${maxReconnectAttempts} attempts. Please refresh the page.`, false);
+      const hadActiveResearch = isResearchActive || academicBusy;
+      lastRequestData = null;
+      isResearchActive = false;
+      reconnectAttempts = 0;
+      setAcademicBusy(false);
+      updateResearchIcon(false);
+      if (hadActiveResearch) updateState('error');
+      updateWebSocketStatus();
       return false;
     }
 
@@ -2092,7 +2121,7 @@ const GPTResearcher = (() => {
     setTimeout(() => {
       try {
         // Setup new WebSocket connection
-        dispose_socket = listenToSockEvents();
+        dispose_socket = listenToSockEvents({ isReconnect: true });
 
         // Set up a one-time handler to send the message after reconnection
         if (message) {
