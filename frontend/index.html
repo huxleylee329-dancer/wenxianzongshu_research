@@ -172,7 +172,20 @@
                     <option value="detailed_report">Detailed - In depth and longer (~5 min)</option>
                     <option value="resource_report">Resource Report</option>
                     <option value="deep">Deep Research</option>
+                    <option value="academic_langgraph">学术固定报告（LangGraph）</option>
                 </select>
+            </div>
+            <div class="form-group academic-profile-options" id="academicProfileOptions" hidden>
+                <label for="academicProfile" class="agent-question">选择固定学术报告结构</label>
+                <select id="academicProfile" class="form-control highlight-connection">
+                    <option value="stem_literature_review">STEM文献综述</option>
+                    <option value="technical_route_survey">技术路线调研</option>
+                    <option value="method_comparison">方法比较</option>
+                    <option value="equipment_material_selection">设备/材料选型</option>
+                    <option value="proposal_research_status">开题研究现状</option>
+                    <option value="systematic_literature_review">系统文献综述</option>
+                </select>
+                <p class="academic-fixed-info">正文与目录 locale：zh-CN；检索器由服务器配置。</p>
             </div>
             <div class="form-group">
                 <label for="tone" class="agent-question">In which tone would you like the report to be
@@ -284,6 +297,40 @@
 
             <input type="submit" value="Begin Research" class="btn btn-primary button-padding" id="submitButton">
         </form>
+
+        <section class="academic-workflow-panel" id="academicWorkflowPanel" hidden aria-live="polite">
+            <h2>学术工作流</h2>
+            <ol class="academic-stages" id="academicStages">
+                <li data-stage="planning">规划</li>
+                <li data-stage="evidence">证据检索</li>
+                <li data-stage="outline">目录生成</li>
+                <li data-stage="approval">等待审批</li>
+                <li data-stage="writing">逐节写作</li>
+                <li data-stage="review">引用审核</li>
+                <li data-stage="human_review">人工复核/完成</li>
+            </ol>
+            <div id="academicOutlinePanel" class="academic-card" hidden>
+                <h3 id="academicOutlineTitle"></h3>
+                <ol id="academicOutlineSections"></ol>
+                <div class="academic-actions">
+                    <button type="button" id="academicApprove" class="btn btn-primary">批准目录</button>
+                    <button type="button" id="academicReject" class="btn btn-secondary">拒绝</button>
+                </div>
+            </div>
+            <div id="academicReviewPanel" class="academic-card" hidden>
+                <h3>机器引用审核需人工复核</h3>
+                <div id="academicReviewSections"></div>
+                <p class="academic-artifact-links" id="academicArtifactLinks"></p>
+                <div class="academic-actions">
+                    <button type="button" id="academicRevise" class="btn btn-primary">修订一次并复审（产生费用）</button>
+                    <button type="button" id="academicExport" class="btn btn-secondary">人工确认并导出（不调用LLM）</button>
+                </div>
+            </div>
+            <div id="academicFinalPanel" class="academic-card" hidden>
+                <h3>学术报告已导出</h3>
+                <p class="academic-artifact-links" id="academicFinalLinks"></p>
+            </div>
+        </section>
 
         <!-- Add JSON button above Research Progress section -->
         <div class="margin-div" id="jsonButtonContainer" style="display: none; text-align: right; margin-bottom: 10px;">

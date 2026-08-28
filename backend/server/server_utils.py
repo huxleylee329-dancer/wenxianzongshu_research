@@ -17,6 +17,10 @@ import logging
 import hashlib
 
 from .multi_agent_runner import run_multi_agent_task
+from .academic_workflow_service import (
+    AcademicWorkflowServiceError,
+    academic_workflow_service,
+)
 
 # Import chat agent
 try:
@@ -29,6 +33,47 @@ except ImportError:
     ChatAgentWithMemory = None
 
 logger = logging.getLogger(__name__)
+
+_ACADEMIC_COMMANDS = frozenset(
+    {"academic_start", "academic_decision", "academic_revise", "academic_export"}
+)
+
+
+def _academic_command_name(data: str) -> str | None:
+    command = data.strip().split(maxsplit=1)[0] if data.strip() else ""
+    return command if command in _ACADEMIC_COMMANDS else None
+
+
+async def handle_academic_command(websocket, data: str) -> None:
+    """Dispatch one browser academic command without exposing internal failures."""
+
+    command = _academic_command_name(data)
+    try:
+        parts = data.strip().split(maxsplit=1)
+        if command is None or len(parts) != 2:
+            raise AcademicWorkflowServiceError("invalid_request")
+        payload = json.loads(parts[1])
+
+        async def emit(message: dict[str, object]) -> None:
+            await websocket.send_json(message)
+
+        if command == "academic_start":
+            await academic_workflow_service.start(payload, emit)
+        elif command == "academic_decision":
+            await academic_workflow_service.decision(payload, emit)
+        elif command == "academic_revise":
+            await academic_workflow_service.revise(payload, emit)
+        else:
+            await academic_workflow_service.export(payload, emit)
+    except asyncio.CancelledError:
+        raise
+    except AcademicWorkflowServiceError as error:
+        await websocket.send_json({"type": "academic_error", "code": error.code})
+    except (json.JSONDecodeError, UnicodeError, TypeError, ValueError):
+        await websocket.send_json({"type": "academic_error", "code": "invalid_request"})
+    except Exception:
+        logger.exception("Academic workflow command failed")
+        await websocket.send_json({"type": "academic_error", "code": "internal_error"})
 
 class CustomLogsHandler:
     """Custom handler to capture streaming logs from the research process"""
@@ -350,7 +395,11 @@ async def handle_websocket_communication(websocket, manager):
         while True:
             try:
                 data = await websocket.receive_text()
-                logger.info(f"Received WebSocket message: {data[:50]}..." if len(data) > 50 else data)
+                academic_command = _academic_command_name(data)
+                if academic_command is not None:
+                    logger.info("Received WebSocket academic command: %s", academic_command)
+                else:
+                    logger.info(f"Received WebSocket message: {data[:50]}..." if len(data) > 50 else data)
                 
                 if data == "ping":
                     await websocket.send_text("pong")
@@ -359,12 +408,21 @@ async def handle_websocket_communication(websocket, manager):
                     logger.warning(
                         f"Received request while task is already running. Request data preview: {data[: min(20, len(data))]}..."
                     )
-                    await websocket.send_json(
-                        {
-                            "type": "logs",
-                            "content": "warning",
-                            "output": "Task already running. Please wait.",
-                        }
+                    if academic_command is not None:
+                        await websocket.send_json(
+                            {"type": "academic_error", "code": "session_busy"}
+                        )
+                    else:
+                        await websocket.send_json(
+                            {
+                                "type": "logs",
+                                "content": "warning",
+                                "output": "Task already running. Please wait.",
+                            }
+                        )
+                elif academic_command is not None:
+                    running_task = run_long_running_task(
+                        handle_academic_command(websocket, data)
                     )
                 # Normalize command detection by checking startswith after stripping whitespace
                 elif data.strip().startswith("start"):

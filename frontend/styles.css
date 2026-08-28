@@ -1309,6 +1309,94 @@ footer a:hover {
     }
 }
 
+.academic-profile-options,
+.academic-workflow-panel {
+    border: 1px solid rgba(0, 123, 255, 0.3);
+    border-radius: 12px;
+    background: rgba(0, 123, 255, 0.05);
+    padding: 18px;
+    margin-bottom: 20px;
+    color: #212529;
+}
+
+.academic-fixed-info {
+    margin: 8px 0 0;
+    color: #5f6b76;
+    font-size: 0.85rem;
+}
+
+.academic-stages {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(90px, 1fr));
+    gap: 8px;
+    padding: 0;
+    list-style: none;
+}
+
+.academic-stages li {
+    padding: 9px 6px;
+    border-radius: 8px;
+    background: #e9ecef;
+    color: #5f6b76;
+    text-align: center;
+    font-size: 0.82rem;
+}
+
+.academic-stages li.active {
+    background: #007bff;
+    color: #fff;
+}
+
+.academic-stages li.complete {
+    background: #d7f2df;
+    color: #176b2c;
+}
+
+.academic-card {
+    margin-top: 16px;
+    padding: 16px;
+    border-radius: 10px;
+    background: #fff;
+    color: #212529;
+}
+
+.academic-card h2,
+.academic-card h3,
+.academic-card li,
+.academic-card p,
+.academic-workflow-panel h2 {
+    color: #212529;
+}
+
+.academic-card li,
+.academic-review-item {
+    margin-bottom: 8px;
+}
+
+.academic-review-item {
+    padding: 10px;
+    border-left: 4px solid #f0ad4e;
+    background: #fff8e7;
+}
+
+.academic-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 14px;
+}
+
+.academic-artifact-links a {
+    display: inline-block;
+    margin-right: 12px;
+}
+
+@media (max-width: 900px) {
+    .academic-stages {
+        grid-template-columns: repeat(2, minmax(120px, 1fr));
+    }
+}
+
 @media (min-width: 769px) and (max-width: 1200px) {
     .history-panel {
         width: 280px;

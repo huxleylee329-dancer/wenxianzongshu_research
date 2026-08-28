@@ -21,6 +21,9 @@ const GPTResearcher = (() => {
   let reconnectAttempts = 0;
   let maxReconnectAttempts = 5;
   let reconnectInterval = 2000; // Start with 2 seconds
+  let academicSessionId = null;
+  let academicRevisionUsed = false;
+  let academicBusy = false;
 
   const init = () => {
     // Check if cookies are enabled
@@ -62,6 +65,9 @@ const GPTResearcher = (() => {
 
     // Initialize MCP functionality
     initMCPSection();
+
+    // Initialize the fixed-profile academic workflow controls.
+    initAcademicWorkflow();
 
     // The download bar is now fixed in place with CSS
     // No need to set display property here
@@ -764,6 +770,200 @@ const GPTResearcher = (() => {
     }
   }
 
+  const isAcademicMode = () => {
+    const reportType = document.getElementById('report_type');
+    return reportType && reportType.value === 'academic_langgraph';
+  };
+
+  const setAcademicBusy = (busy) => {
+    academicBusy = busy;
+    const submit = document.getElementById('submitButton');
+    if (submit && isAcademicMode()) submit.disabled = busy;
+    ['academicApprove', 'academicReject', 'academicExport'].forEach((id) => {
+      const button = document.getElementById(id);
+      if (button) button.disabled = busy;
+    });
+    const revise = document.getElementById('academicRevise');
+    if (revise) revise.disabled = busy || academicRevisionUsed;
+  };
+
+  const toggleAcademicMode = () => {
+    const academic = isAcademicMode();
+    const profile = document.getElementById('academicProfileOptions');
+    if (profile) profile.hidden = !academic;
+    ['tone', 'report_source', 'maxSearchResults', 'queryDomains', 'mcpEnabled']
+      .forEach((id) => {
+        const input = document.getElementById(id);
+        const group = input ? input.closest('.form-group') : null;
+        if (group) group.hidden = academic;
+      });
+    const submit = document.getElementById('submitButton');
+    if (submit && !academic) submit.disabled = false;
+  };
+
+  const resetAcademicWorkflow = () => {
+    academicSessionId = null;
+    academicRevisionUsed = false;
+    setAcademicBusy(false);
+    const panel = document.getElementById('academicWorkflowPanel');
+    const outline = document.getElementById('academicOutlinePanel');
+    const review = document.getElementById('academicReviewPanel');
+    const finalPanel = document.getElementById('academicFinalPanel');
+    if (panel) panel.hidden = !isAcademicMode();
+    if (outline) outline.hidden = true;
+    if (review) review.hidden = true;
+    if (finalPanel) finalPanel.hidden = true;
+    document.querySelectorAll('#academicStages li').forEach((item) => {
+      item.classList.remove('active', 'complete');
+    });
+  };
+
+  const updateAcademicStage = (stage) => {
+    const order = ['planning', 'evidence', 'outline', 'approval', 'writing', 'review', 'human_review'];
+    const activeIndex = order.indexOf(stage === 'complete' ? 'human_review' : stage);
+    document.querySelectorAll('#academicStages li').forEach((item) => {
+      const index = order.indexOf(item.dataset.stage);
+      item.classList.toggle('complete', activeIndex >= 0 && index < activeIndex);
+      item.classList.toggle('active', index === activeIndex);
+    });
+  };
+
+  const sendAcademicCommand = (command, payload) => {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      showToast('学术工作流连接不可用');
+      return false;
+    }
+    socket.send(`${command} ${JSON.stringify(payload)}`);
+    return true;
+  };
+
+  const academicDecision = (decision) => {
+    if (academicBusy || !academicSessionId) return;
+    const warning = decision === 'approve'
+      ? '批准后将产生多次真实LLM调用和费用，且不应重复点击。确认批准？'
+      : '确认拒绝该目录并结束工作流？';
+    if (!window.confirm(warning)) return;
+    setAcademicBusy(true);
+    if (!sendAcademicCommand('academic_decision', {
+      session_id: academicSessionId,
+      decision: decision,
+    })) setAcademicBusy(false);
+  };
+
+  const initAcademicWorkflow = () => {
+    const reportType = document.getElementById('report_type');
+    if (reportType) reportType.addEventListener('change', toggleAcademicMode);
+    toggleAcademicMode();
+    document.getElementById('academicApprove')?.addEventListener('click', () => academicDecision('approve'));
+    document.getElementById('academicReject')?.addEventListener('click', () => academicDecision('reject'));
+    document.getElementById('academicRevise')?.addEventListener('click', () => {
+      if (academicBusy || academicRevisionUsed || !academicSessionId) return;
+      if (!window.confirm('修订将再次产生真实LLM调用和费用，本会话仅允许一次。继续？')) return;
+      academicRevisionUsed = true;
+      setAcademicBusy(true);
+      if (!sendAcademicCommand('academic_revise', { session_id: academicSessionId })) {
+        academicRevisionUsed = false;
+        setAcademicBusy(false);
+      }
+    });
+    document.getElementById('academicExport')?.addEventListener('click', () => {
+      if (academicBusy || !academicSessionId) return;
+      if (!window.confirm('这是人工确认导出，不会改变机器Disposition，也不会调用LLM。继续？')) return;
+      setAcademicBusy(true);
+      if (!sendAcademicCommand('academic_export', { session_id: academicSessionId })) {
+        setAcademicBusy(false);
+      }
+    });
+  };
+
+  const appendAcademicLink = (container, label, url) => {
+    if (typeof url !== 'string' || !url.startsWith('/outputs/academic/')) return;
+    const link = document.createElement('a');
+    link.href = url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = label;
+    container.appendChild(link);
+  };
+
+  const handleAcademicMessage = (data, converter) => {
+    if (typeof data.type !== 'string' || !data.type.startsWith('academic_')) return false;
+    const outlinePanel = document.getElementById('academicOutlinePanel');
+    const reviewPanel = document.getElementById('academicReviewPanel');
+    const finalPanel = document.getElementById('academicFinalPanel');
+    if (data.type === 'academic_progress') {
+      updateAcademicStage(data.stage);
+    } else if (data.type === 'academic_outline') {
+      academicSessionId = data.session_id;
+      setAcademicBusy(false);
+      isResearchActive = false;
+      updateResearchIcon(false);
+      updateAcademicStage('approval');
+      document.getElementById('academicOutlineTitle').textContent = data.title || '';
+      const list = document.getElementById('academicOutlineSections');
+      list.replaceChildren();
+      if (Array.isArray(data.sections)) data.sections.forEach((section) => {
+        const item = document.createElement('li');
+        item.textContent = `${section.section_id} · ${section.section_role} · ${section.title}`;
+        list.appendChild(item);
+      });
+      outlinePanel.hidden = false;
+      reviewPanel.hidden = true;
+      finalPanel.hidden = true;
+    } else if (data.type === 'academic_review_required') {
+      academicSessionId = data.session_id;
+      academicRevisionUsed = Boolean(data.revision_used);
+      setAcademicBusy(false);
+      isResearchActive = false;
+      updateResearchIcon(false);
+      updateAcademicStage('human_review');
+      outlinePanel.hidden = true;
+      reviewPanel.hidden = false;
+      finalPanel.hidden = true;
+      const sections = document.getElementById('academicReviewSections');
+      sections.replaceChildren();
+      if (Array.isArray(data.reviews)) data.reviews.forEach((review) => {
+        const item = document.createElement('div');
+        item.className = 'academic-review-item';
+        const issues = Array.isArray(review.issues) ? review.issues.join(', ') : '';
+        item.textContent = `${review.section_id}: ${review.verdict}; ${issues}`;
+        sections.appendChild(item);
+      });
+      const links = document.getElementById('academicArtifactLinks');
+      links.replaceChildren();
+      appendAcademicLink(links, '机器草稿', data.draft_url);
+      appendAcademicLink(links, '引用审计 Markdown', data.audit_markdown_url);
+      appendAcademicLink(links, '引用审计 JSON', data.audit_json_url);
+    } else if (data.type === 'academic_ready' || data.type === 'academic_final') {
+      const rejected = data.type === 'academic_final' && data.result === 'rejected';
+      if (data.session_id) academicSessionId = data.session_id;
+      setAcademicBusy(false);
+      isResearchActive = false;
+      updateAcademicStage('complete');
+      updateResearchIcon(false);
+      outlinePanel.hidden = true;
+      reviewPanel.hidden = true;
+      finalPanel.hidden = rejected;
+      if (rejected) addAgentResponse({ output: '学术目录已拒绝，工作流已结束。' });
+      if (typeof data.markdown === 'string') {
+        writeReport({ output: data.markdown, type: 'report' }, converter, true, false);
+      }
+      if (data.url) {
+        const links = document.getElementById('academicFinalLinks');
+        links.replaceChildren();
+        appendAcademicLink(links, '最终 Markdown', data.url);
+      }
+      updateState('finished');
+    } else if (data.type === 'academic_error') {
+      setAcademicBusy(false);
+      isResearchActive = false;
+      updateResearchIcon(false);
+      addAgentResponse({ output: `Academic workflow error: ${data.code || 'internal_error'}` });
+      updateState('error');
+    }
+    return true;
+  };
+
   // Function to update the research icon spinning state
   const updateResearchIcon = (isSpinning) => {
     const modernSpinner = document.getElementById('modernSpinner');
@@ -785,6 +985,8 @@ const GPTResearcher = (() => {
     allReports = '';
     currentReport = '';
     isFirstReport = true;
+    resetAcademicWorkflow();
+    if (isAcademicMode()) setAcademicBusy(true);
 
     // Hide the download bar
     const stickyDownloadsBar = document.getElementById('stickyDownloadsBar');
@@ -860,14 +1062,20 @@ const GPTResearcher = (() => {
       reconnectAttempts = 0;
 
       const data = JSON.parse(event.data)
-      console.log("Received message:", data);  // Debug log
+      if (typeof data.type === 'string' && data.type.startsWith('academic_')) {
+        console.log("Received academic message:", data.type);
+      } else {
+        console.log("Received message:", data);  // Debug log
+      }
 
       // Update WebSocket metrics
       messagesReceived++;
       lastActivityTime = Date.now();
       updateWebSocketStatus();
 
-      if (data.type === 'logs') {
+      if (handleAcademicMessage(data, converter)) {
+        return;
+      } else if (data.type === 'logs') {
         if (data.content === 'subqueries' && data.metadata && Array.isArray(data.metadata)) {
           displaySubQuestions(data.metadata)
         }
@@ -961,6 +1169,17 @@ const GPTResearcher = (() => {
       const report_type = document.querySelector(
         'select[name="report_type"]'
       ).value
+
+      if (report_type === 'academic_langgraph') {
+        const requestData = {
+          query: task,
+          report_mode: document.getElementById('academicProfile').value,
+        };
+        lastRequestData = requestData;
+        setAcademicBusy(true);
+        socket.send(`academic_start ${JSON.stringify(requestData)}`);
+        return;
+      }
       const report_source = document.querySelector(
         'select[name="report_source"]'
       ).value
