@@ -35,7 +35,8 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 _ACADEMIC_COMMANDS = frozenset(
-    {"academic_start", "academic_decision", "academic_revise", "academic_export"}
+    {"academic_start", "academic_decision", "academic_revise", "academic_export",
+     "academic_revision_decision", "academic_draft_state"}
 )
 
 
@@ -46,6 +47,14 @@ def _academic_command_name(data: str) -> str | None:
 
 async def handle_academic_command(websocket, data: str) -> None:
     """Dispatch one browser academic command without exposing internal failures."""
+
+    async def send_error(code: str) -> None:
+        try:
+            await websocket.send_json({"type": "academic_error", "code": code})
+        except Exception:
+            # A disconnected socket cannot receive a second failure message.
+            # Saved revision candidates remain available through academic_draft_state.
+            logger.warning("Academic error notification could not be delivered")
 
     command = _academic_command_name(data)
     try:
@@ -63,17 +72,21 @@ async def handle_academic_command(websocket, data: str) -> None:
             await academic_workflow_service.decision(payload, emit)
         elif command == "academic_revise":
             await academic_workflow_service.revise(payload, emit)
+        elif command == "academic_revision_decision":
+            await academic_workflow_service.revision_decision(payload, emit)
+        elif command == "academic_draft_state":
+            await academic_workflow_service.draft_state(payload, emit)
         else:
             await academic_workflow_service.export(payload, emit)
     except asyncio.CancelledError:
         raise
     except AcademicWorkflowServiceError as error:
-        await websocket.send_json({"type": "academic_error", "code": error.code})
+        await send_error(error.code)
     except (json.JSONDecodeError, UnicodeError, TypeError, ValueError):
-        await websocket.send_json({"type": "academic_error", "code": "invalid_request"})
+        await send_error("invalid_request")
     except Exception:
         logger.exception("Academic workflow command failed")
-        await websocket.send_json({"type": "academic_error", "code": "internal_error"})
+        await send_error("internal_error")
 
 class CustomLogsHandler:
     """Custom handler to capture streaming logs from the research process"""

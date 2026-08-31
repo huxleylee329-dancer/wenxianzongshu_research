@@ -24,6 +24,8 @@ const GPTResearcher = (() => {
   let academicSessionId = null;
   let academicRevisionUsed = false;
   let academicBusy = false;
+  let academicDraftWorkspace = null;
+  let academicExportedVersion = null;
 
   const init = () => {
     // Check if cookies are enabled
@@ -784,7 +786,22 @@ const GPTResearcher = (() => {
       if (button) button.disabled = busy;
     });
     const revise = document.getElementById('academicRevise');
-    if (revise) revise.disabled = busy || academicRevisionUsed;
+    if (revise) revise.disabled = busy || (academicDraftWorkspace
+      ? Boolean(academicDraftWorkspace.pending) : academicRevisionUsed);
+    const pending = Boolean(academicDraftWorkspace?.pending);
+    ['academicAcceptRevision', 'academicDiscardRevision'].forEach((id) => {
+      const button = document.getElementById(id);
+      if (button) button.disabled = busy || !pending;
+    });
+    ['academicSelectAll', 'academicSelectNone', 'academicGlobalFeedback'].forEach((id) => {
+      const element = document.getElementById(id);
+      if (element) element.disabled = busy || pending;
+    });
+    document.querySelectorAll('#academicEditableSections input, #academicEditableSections textarea').forEach((element) => {
+      element.disabled = busy || pending;
+    });
+    const exportButton = document.getElementById('academicExport');
+    if (exportButton && pending) exportButton.disabled = true;
   };
 
   const toggleAcademicMode = () => {
@@ -804,6 +821,8 @@ const GPTResearcher = (() => {
   const resetAcademicWorkflow = () => {
     academicSessionId = null;
     academicRevisionUsed = false;
+    academicDraftWorkspace = null;
+    academicExportedVersion = null;
     setAcademicBusy(false);
     const panel = document.getElementById('academicWorkflowPanel');
     const outline = document.getElementById('academicOutlinePanel');
@@ -813,6 +832,8 @@ const GPTResearcher = (() => {
     if (outline) outline.hidden = true;
     if (review) review.hidden = true;
     if (finalPanel) finalPanel.hidden = true;
+    const editor = document.getElementById('academicRevisionPanel');
+    if (editor) editor.hidden = true;
     document.querySelectorAll('#academicStages li').forEach((item) => {
       item.classList.remove('active', 'complete');
     });
@@ -857,23 +878,180 @@ const GPTResearcher = (() => {
     document.getElementById('academicApprove')?.addEventListener('click', () => academicDecision('approve'));
     document.getElementById('academicReject')?.addEventListener('click', () => academicDecision('reject'));
     document.getElementById('academicRevise')?.addEventListener('click', () => {
+      if (academicDraftWorkspace) {
+        submitAcademicFeedback();
+        return;
+      }
       if (academicBusy || academicRevisionUsed || !academicSessionId) return;
       if (!window.confirm('修订将再次产生真实LLM调用和费用，本会话仅允许一次。继续？')) return;
-      academicRevisionUsed = true;
       setAcademicBusy(true);
       if (!sendAcademicCommand('academic_revise', { session_id: academicSessionId })) {
-        academicRevisionUsed = false;
         setAcademicBusy(false);
       }
     });
     document.getElementById('academicExport')?.addEventListener('click', () => {
       if (academicBusy || !academicSessionId) return;
-      if (!window.confirm('这是人工确认导出，不会改变机器Disposition，也不会调用LLM。继续？')) return;
+      const exportWarning = academicDraftWorkspace?.machine_ready
+        ? '将导出当前已采用版本，不调用LLM。继续？'
+        : '这是人工确认导出，不会改变机器Disposition，也不会调用LLM。继续？';
+      if (!window.confirm(exportWarning)) return;
       setAcademicBusy(true);
-      if (!sendAcademicCommand('academic_export', { session_id: academicSessionId })) {
+      const payload = { session_id: academicSessionId };
+      if (academicDraftWorkspace) payload.version = academicDraftWorkspace.current_version;
+      if (!sendAcademicCommand('academic_export', payload)) {
         setAcademicBusy(false);
       }
     });
+    ['academicSelectAll', 'academicSelectNone'].forEach((id) => {
+      document.getElementById(id)?.addEventListener('click', () => {
+        document.querySelectorAll('#academicEditableSections input[type="checkbox"]').forEach((input) => {
+          input.checked = id === 'academicSelectAll';
+        });
+      });
+    });
+    ['academicAcceptRevision', 'academicDiscardRevision'].forEach((id) => {
+      document.getElementById(id)?.addEventListener('click', () => {
+        const pending = academicDraftWorkspace?.pending;
+        if (academicBusy || !pending) return;
+        setAcademicBusy(true);
+        if (!sendAcademicCommand('academic_revision_decision', {
+          session_id: academicSessionId,
+          base_version: academicDraftWorkspace.current_version,
+          version: pending.version,
+          decision: id === 'academicAcceptRevision' ? 'accept' : 'discard',
+        })) setAcademicBusy(false);
+      });
+    });
+  };
+
+  const submitAcademicFeedback = () => {
+    if (academicBusy || !academicDraftWorkspace || academicDraftWorkspace.pending) return;
+    const feedback = document.getElementById('academicGlobalFeedback').value.trim();
+    const sectionIds = [];
+    const sectionFeedback = {};
+    document.querySelectorAll('#academicEditableSections .academic-editor-section').forEach((card) => {
+      if (!card.querySelector('input').checked) return;
+      sectionIds.push(card.dataset.sectionId);
+      sectionFeedback[card.dataset.sectionId] = card.querySelector('textarea').value.trim();
+    });
+    const notice = document.getElementById('academicRevisionNotice');
+    if (!sectionIds.length) { notice.textContent = '请至少选择一个需要修改的章节。'; return; }
+    if (sectionIds.some((id) => !feedback && !sectionFeedback[id])) {
+      notice.textContent = '请填写总体要求，或为每个所选章节填写具体意见。'; return;
+    }
+    if (feedback.length + Object.values(sectionFeedback).reduce((sum, value) => sum + value.length, 0) > 12000) {
+      notice.textContent = '修改意见合计不能超过 12,000 字符。'; return;
+    }
+    const count = academicDraftWorkspace.sections.length;
+    if (!window.confirm(`将修订 ${sectionIds.length} 节，并复审全部 ${count} 节。通常 ${sectionIds.length + count} 次、最多 ${sectionIds.length * 2 + count} 次模型调用（不含SDK传输重试），会产生费用。未选章节正文不变；新版需要你确认采用。继续？`)) return;
+    const requestId = window.crypto?.randomUUID?.() || `revision-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    setAcademicBusy(true);
+    notice.textContent = '正在按意见修订。请勿重复启动；当前版本仍保留。';
+    if (!sendAcademicCommand('academic_revise', {
+      session_id: academicSessionId, base_version: academicDraftWorkspace.current_version,
+      request_id: requestId, section_ids: sectionIds, feedback, section_feedback: sectionFeedback,
+    })) setAcademicBusy(false);
+  };
+
+  const isExportedAcademicWorkspace = (workspace) => Boolean(workspace
+    && academicExportedVersion?.sessionId === workspace.session_id
+    && academicExportedVersion?.version === workspace.current_version);
+
+  const renderAcademicDraftWorkspace = (workspace) => {
+    if (!workspace || !Array.isArray(workspace.sections)) return;
+    const sameVersion = academicDraftWorkspace?.session_id === workspace.session_id
+      && academicDraftWorkspace?.current_version === workspace.current_version;
+    if (!sameVersion) academicExportedVersion = null;
+    const saved = new Map();
+    if (sameVersion) document.querySelectorAll('#academicEditableSections .academic-editor-section').forEach((card) => {
+      saved.set(card.dataset.sectionId, { checked: card.querySelector('input').checked, feedback: card.querySelector('textarea').value });
+    });
+    academicDraftWorkspace = workspace;
+    academicSessionId = workspace.session_id;
+    academicRevisionUsed = false;
+    document.getElementById('academicRevisionPanel').hidden = isExportedAcademicWorkspace(workspace);
+    document.getElementById('academicVersionLabel').textContent = `当前 v${workspace.current_version} · ${workspace.machine_ready ? '引用审核通过' : '需人工复核'}`;
+    const globalFeedback = document.getElementById('academicGlobalFeedback');
+    if (!sameVersion) globalFeedback.value = '';
+    const list = document.getElementById('academicEditableSections');
+    list.replaceChildren();
+    workspace.sections.forEach((section, index) => {
+      const card = document.createElement('section');
+      card.className = 'academic-editor-section';
+      card.dataset.sectionId = section.section_id;
+      const label = document.createElement('label');
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = saved.get(section.section_id)?.checked || false;
+      label.append(checkbox, document.createTextNode(`修改 ${index + 1}. ${section.title}`));
+      card.appendChild(label);
+      const review = document.createElement('p');
+      review.className = 'academic-section-review';
+      review.textContent = `${section.verdict} · ${(section.issues || []).join(', ')} — ${section.rationale || ''}`;
+      card.appendChild(review);
+      const details = document.createElement('details');
+      const summary = document.createElement('summary');
+      summary.textContent = '查看当前正文';
+      const content = document.createElement('div');
+      content.className = 'academic-section-body';
+      content.textContent = section.content;
+      details.append(summary, content);
+      card.appendChild(details);
+      const feedbackLabel = document.createElement('label');
+      feedbackLabel.htmlFor = `academicSectionFeedback${index}`;
+      feedbackLabel.textContent = `第 ${index + 1} 节修改意见`;
+      const textarea = document.createElement('textarea');
+      textarea.id = feedbackLabel.htmlFor;
+      textarea.maxLength = 2000;
+      textarea.rows = 2;
+      textarea.placeholder = '指出具体段落的问题，并说明希望如何修改。';
+      textarea.value = saved.get(section.section_id)?.feedback || '';
+      card.append(feedbackLabel, textarea);
+      list.appendChild(card);
+    });
+    const pending = workspace.pending;
+    document.getElementById('academicRevisionPreview').hidden = !pending;
+    const comparison = document.getElementById('academicRevisionComparison');
+    comparison.replaceChildren();
+    if (pending) {
+      document.getElementById('academicCandidateStatus').textContent = `候选 v${pending.version} · ${pending.machine_ready ? '引用审核通过' : '仍有审核意见，请检查'}。未选章节正文保持不变。`;
+      (pending.sections || []).filter((section) => pending.section_ids.includes(section.section_id)).forEach((section) => {
+        const old = workspace.sections.find((item) => item.section_id === section.section_id);
+        const item = document.createElement('section');
+        item.className = 'academic-editor-section';
+        const title = document.createElement('h4'); title.textContent = section.title;
+        const instruction = document.createElement('p');
+        instruction.textContent = `你的意见：${[pending.feedback, pending.section_feedback[section.section_id]].filter(Boolean).join('；')}`;
+        const changeSummary = document.createElement('p');
+        changeSummary.className = 'academic-section-review';
+        changeSummary.textContent = `${old?.content === section.content ? '正文未变化' : '正文已更新'} · ${old?.content?.length || 0} → ${section.content.length} 字符`;
+        const grid = document.createElement('div'); grid.className = 'academic-compare-grid';
+        [['修订前', old?.content || ''], ['修订后', section.content]].forEach(([heading, body]) => {
+          const column = document.createElement('div');
+          const caption = document.createElement('h5'); caption.textContent = heading;
+          const text = document.createElement('div'); text.className = 'academic-section-body'; text.textContent = body;
+          column.append(caption, text); grid.appendChild(column);
+        });
+        const verdict = document.createElement('p'); verdict.className = 'academic-section-review';
+        verdict.textContent = `复审：${section.verdict} — ${section.rationale || ''}`;
+        item.append(title, instruction, changeSummary, grid, verdict); comparison.appendChild(item);
+      });
+    }
+    const history = document.getElementById('academicVersionHistory'); history.replaceChildren();
+    const statusNames = { accepted: '已采用', pending: '待决定', discarded: '保留旧版' };
+    (workspace.versions || []).forEach((version) => {
+      const row = document.createElement('p');
+      row.textContent = `v${version.version}${version.version === workspace.current_version ? '（当前）' : ''} · ${statusNames[version.decision] || version.decision} `;
+      appendAcademicLink(row, '正文快照', version.draft_url);
+      appendAcademicLink(row, '引用审计', version.audit_url);
+      history.appendChild(row);
+    });
+    document.getElementById('academicRevisionNotice').textContent = pending
+      ? '候选稿已保存。请采用新版或保留旧版，再开始下一轮。'
+      : '可以继续提出意见；只有你选中的章节会重写。';
+    document.getElementById('academicExport').textContent = workspace.machine_ready
+      ? '导出当前版本（不调用LLM）' : '人工确认并导出当前版本（不调用LLM）';
+    setAcademicBusy(false);
   };
 
   const appendAcademicLink = (container, label, url) => {
@@ -891,6 +1069,23 @@ const GPTResearcher = (() => {
     const outlinePanel = document.getElementById('academicOutlinePanel');
     const reviewPanel = document.getElementById('academicReviewPanel');
     const finalPanel = document.getElementById('academicFinalPanel');
+    if (data.type === 'academic_revision_preview' || data.type === 'academic_draft_updated') {
+      const changed = academicDraftWorkspace?.current_version !== data.draft_workspace?.current_version;
+      setAcademicBusy(false);
+      isResearchActive = false;
+      updateResearchIcon(false);
+      updateAcademicStage('human_review');
+      outlinePanel.hidden = true;
+      reviewPanel.hidden = true;
+      finalPanel.hidden = true;
+      if (changed) document.getElementById('reportContainer').replaceChildren();
+      renderAcademicDraftWorkspace(data.draft_workspace);
+      // A reconnect refresh is not a request to edit an already exported version.
+      const exported = isExportedAcademicWorkspace(data.draft_workspace);
+      finalPanel.hidden = !exported;
+      updateAcademicStage(exported ? 'complete' : 'human_review');
+      return true;
+    }
     if (data.type === 'academic_progress') {
       updateAcademicStage(data.stage);
     } else if (data.type === 'academic_outline') {
@@ -954,15 +1149,66 @@ const GPTResearcher = (() => {
         const links = document.getElementById('academicFinalLinks');
         links.replaceChildren();
         appendAcademicLink(links, '最终 Markdown', data.url);
+        if (data.type === 'academic_final'
+            && ['human_confirmed_export', 'machine_ready_export'].includes(data.result)
+            && (data.draft_workspace || academicDraftWorkspace)) {
+          const reopen = document.createElement('button');
+          reopen.type = 'button';
+          reopen.className = 'btn btn-secondary';
+          reopen.textContent = '继续修订（不调用LLM）';
+          reopen.addEventListener('click', () => {
+            academicExportedVersion = null;
+            const editor = document.getElementById('academicRevisionPanel');
+            editor.hidden = false;
+            finalPanel.hidden = true;
+            updateAcademicStage('human_review');
+            editor.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          });
+          links.appendChild(reopen);
+        }
       }
       updateState('finished');
     } else if (data.type === 'academic_error') {
+      const code = data.code || 'internal_error';
+      const retryableRevisionFailure = code === 'revision_failed';
+      if (retryableRevisionFailure) academicRevisionUsed = false;
       setAcademicBusy(false);
       isResearchActive = false;
       lastRequestData = null;
       updateResearchIcon(false);
-      addAgentResponse({ output: `Academic workflow error: ${data.code || 'internal_error'}` });
-      updateState('error');
+      addAgentResponse({ output: `Academic workflow error: ${code}` });
+      if (retryableRevisionFailure || academicDraftWorkspace) {
+        updateAcademicStage('human_review');
+        outlinePanel.hidden = true;
+        reviewPanel.hidden = Boolean(academicDraftWorkspace);
+        finalPanel.hidden = true;
+        if (academicDraftWorkspace) {
+          const messages = {
+            revision_failed: '本轮修订未完成，当前稿和意见已保留。可调整意见后手动重试。',
+            invalid_feedback: '请为所选章节填写有效意见，且不要超过长度限制。',
+            invalid_sections: '请选择当前版本中的有效章节。',
+            revision_pending: '已有候选稿，请先采用或保留旧版。',
+            stale_version: '版本已变化，正在读取最新版本。',
+            revision_decision_failed: '版本选择保存失败，候选稿仍保留，请重试。',
+          };
+          document.getElementById('academicRevisionNotice').textContent = messages[code] || `操作未完成：${code}`;
+          if (code === 'stale_version' || code === 'revision_pending') {
+            sendAcademicCommand('academic_draft_state', { session_id: academicSessionId });
+          }
+        }
+      } else {
+        updateState('error');
+      }
+    }
+    if (data.draft_workspace) renderAcademicDraftWorkspace(data.draft_workspace);
+    // Apply this after rendering: rendering must not reopen the just-confirmed draft.
+    if (data.type === 'academic_final'
+        && ['human_confirmed_export', 'machine_ready_export'].includes(data.result)) {
+      academicExportedVersion = academicDraftWorkspace ? {
+        sessionId: academicDraftWorkspace.session_id,
+        version: academicDraftWorkspace.current_version,
+      } : null;
+      document.getElementById('academicRevisionPanel').hidden = true;
     }
     return true;
   };
@@ -1177,6 +1423,11 @@ const GPTResearcher = (() => {
       // run left metadata behind.
       if (isReconnect) {
         console.log("Reconnected during active research, not sending new start command");
+        if (academicSessionId && academicDraftWorkspace) {
+          // Read the saved result after a disconnect; never replay a paid revision.
+          setAcademicBusy(true);
+          connectionSocket.send(`academic_draft_state ${JSON.stringify({ session_id: academicSessionId })}`);
+        }
         return;
       }
 
@@ -1250,7 +1501,7 @@ const GPTResearcher = (() => {
       console.log("WebSocket connection closed", event);
 
       // If research is active, try to automatically reconnect
-      if (isResearchActive) {
+      if (isResearchActive || academicBusy || academicDraftWorkspace) {
         reconnectWebSocket();
       }
     }

@@ -27,9 +27,9 @@ from gpt_researcher.workflows.academic_writing.citation_review_disposition impor
     gate_citation_review_disposition,
 )
 from gpt_researcher.workflows.academic_writing.citation_reviewer import (
-    GPTResearcherCitationReviewerAdapter,
     WorkflowSectionCitationReview,
 )
+from gpt_researcher.workflows.academic_writing import citation_reviewer as _reviewer_core
 from gpt_researcher.workflows.academic_writing.graph import (
     resume_academic_workflow,
     start_academic_workflow,
@@ -88,7 +88,10 @@ _MARKER_RUN = re.compile(
     r"\[\[cite:[^\[\]]+\]\](?:[ \t]*\[\[cite:[^\[\]]+\]\])*"
 )
 _DOI = re.compile(r"^10\.\d{4,9}/[-._;()/:A-Z0-9]+$", re.IGNORECASE)
-_REVISION_MESSAGE_MAX_BYTES = 65_536
+_REVISION_MESSAGE_MAX_CHARS = 65_536
+_REVISION_CONTEXT_MAX_COUNT = 8
+_REVISION_CONTEXT_MAX_CHARS = 4_096
+_REVISION_CONTEXT_TOTAL_MAX_CHARS = 24_576
 _REVIEWER_CAVEAT = (
     "Reviewer output is a model opinion and may reflect bounded provenance projection."
 )
@@ -99,6 +102,15 @@ _REVISION_SUFFIX = (
     "markers listed in original_section_citation_markers, and retain a marker only when "
     "the supplied evidence supports the retained text. Never fabricate or automatically "
     "insert a citation. Return only the normal production content JSON response."
+)
+_FEEDBACK_SUFFIX = (
+    " Revise existing_section_content according to human_feedback.global and "
+    "human_feedback.section. These are editorial requests, not factual evidence. "
+    "You may reorganize, clarify, shorten, or expand explanations supported by the "
+    "supplied evidence. If a request needs missing evidence, state that limitation; "
+    "do not fabricate facts, sources, searches, or citations. Use prior_review as "
+    "additional guidance, even if its verdict is supported. Use only markers in "
+    "original_section_citation_markers. Return only the production content JSON."
 )
 
 SafeEmitter = Callable[[dict[str, object]], Awaitable[None]]
@@ -196,11 +208,15 @@ class _RevisionClient:
         draft: WorkflowSectionDraft,
         review: WorkflowSectionCitationReview,
         original_ids: tuple[str, ...],
+        evidence_blocks: tuple[str, ...],
+        feedback: tuple[str, str] | None = None,
     ) -> None:
         self._inner = inner
         self._draft = draft
         self._review = review
         self._original_ids = original_ids
+        self._evidence_blocks = evidence_blocks
+        self._feedback = feedback
 
     async def complete(self, *, system_message: str, user_message: str) -> object:
         payload = json.loads(user_message)
@@ -208,14 +224,38 @@ class _RevisionClient:
             raise AcademicWorkflowServiceError("revision_failed")
         payload["existing_section_content"] = self._draft.content
         payload["prior_review"] = self._review.model_dump(mode="json")
+        if self._feedback is not None:
+            payload["human_feedback"] = {
+                "global": self._feedback[0], "section": self._feedback[1]
+            }
         payload["original_section_citation_markers"] = [
             "[[cite:" + source_id + "]]" for source_id in self._original_ids
         ]
+        evidence_sources = payload.get("evidence_sources")
+        if type(evidence_sources) is not list:
+            raise AcademicWorkflowServiceError("revision_failed")
+        source_by_id = {
+            source.get("source_id"): source
+            for source in evidence_sources
+            if type(source) is dict and type(source.get("source_id")) is str
+        }
+        if len(source_by_id) != len(evidence_sources):
+            raise AcademicWorkflowServiceError("revision_failed")
+        try:
+            selected_sources = [
+                source_by_id[source_id] for source_id in self._original_ids
+            ]
+        except KeyError:
+            raise AcademicWorkflowServiceError("revision_failed") from None
+        payload["evidence_sources"] = selected_sources
+        payload["context_blocks"] = list(self._evidence_blocks)
         revised_message = _canonical_bytes(payload).decode("utf-8")
-        if len(revised_message.encode("utf-8")) > _REVISION_MESSAGE_MAX_BYTES:
+        if len(revised_message) > _REVISION_MESSAGE_MAX_CHARS:
             raise AcademicWorkflowServiceError("revision_failed")
         return await self._inner.complete(
-            system_message=system_message + _REVISION_SUFFIX,
+            system_message=system_message + (
+                _REVISION_SUFFIX if self._feedback is None else _FEEDBACK_SUFFIX
+            ),
             user_message=revised_message,
         )
 
@@ -226,10 +266,14 @@ class _RevisionClientFactory:
         draft: WorkflowSectionDraft,
         review: WorkflowSectionCitationReview,
         original_ids: tuple[str, ...],
+        evidence_blocks: tuple[str, ...],
+        feedback: tuple[str, str] | None = None,
     ) -> None:
         self._draft = draft
         self._review = review
         self._original_ids = original_ids
+        self._evidence_blocks = evidence_blocks
+        self._feedback = feedback
 
     def __call__(self) -> _RevisionClient:
         return _RevisionClient(
@@ -237,6 +281,8 @@ class _RevisionClientFactory:
             self._draft,
             self._review,
             self._original_ids,
+            self._evidence_blocks,
+            self._feedback,
         )
 
 
@@ -248,7 +294,10 @@ class _SafeRunRecorder:
         self._path = output_dir / "workflow-status.json"
         self._events: list[dict[str, object]] = []
 
-    def record(self, stage: str, status: str, code: str | None = None) -> None:
+    def record(
+        self, stage: str, status: str, code: str | None = None,
+        *, section_id: str | None = None,
+    ) -> None:
         event: dict[str, object] = {
             "order": len(self._events) + 1,
             "stage": stage,
@@ -256,6 +305,8 @@ class _SafeRunRecorder:
         }
         if code is not None:
             event["code"] = code
+        if section_id is not None:
+            event["section_id"] = section_id
         self._events.append(event)
         _atomic_json(
             self._path,
@@ -268,9 +319,12 @@ class _SafeRunRecorder:
 
 
 class _ObservedSequence:
-    def __init__(self, delegate: _Sequence, recorder: _SafeRunRecorder) -> None:
+    def __init__(
+        self, delegate: _Sequence, recorder: _SafeRunRecorder, output_dir: Path,
+    ) -> None:
         self._delegate = delegate
         self._recorder = recorder
+        self._output_dir = output_dir
 
     async def write_sections(
         self, state: AcademicWorkflowState
@@ -290,6 +344,14 @@ class _ObservedSequence:
             )
             raise AcademicWorkflowServiceError("citation_plan_invalid")
         self._recorder.record("citation_preflight", "completed")
+        # Preserve paid, structurally valid writing before any model review starts.
+        # This is explicitly unreviewed, never a machine-approved final report.
+        merged = merge_sections(state, drafts)
+        _atomic_write(
+            self._output_dir / "unreviewed-draft.md",
+            "> 未审核草稿：自动引用审核尚未完成，不代表事实或引用已获确认。\n\n"
+            + merged.content,
+        )
         self._recorder.record("section_writer", "completed")
         return drafts
 
@@ -306,6 +368,80 @@ class _PreparedSectionWriter:
     ) -> WorkflowSectionDraft:
         del state
         return await self._delegate.write_section(self._state, section_id)
+
+
+class _WebCitationReviewer:
+    """Keep valid writing usable when a model opinion is unavailable.
+
+    Reuse the production preflight, client, parser and cancellation handling.
+    Only the web orchestration policy differs: a failed per-section opinion
+    becomes an explicit human-review placeholder, not a fabricated model verdict.
+    Invalid evidence/Gate plans still stop before constructing any client.
+    """
+
+    def __init__(self, recorder: _SafeRunRecorder, emit: SafeEmitter) -> None:
+        self._recorder = recorder
+        self._emit = emit
+
+    async def review_citations(
+        self,
+        state: AcademicWorkflowState,
+        drafts: tuple[WorkflowSectionDraft, ...],
+        gate_result: object,
+    ) -> tuple[WorkflowSectionCitationReview, ...]:
+        plan = _reviewer_core._prepare_review_plan(state, drafts, gate_result)
+        if type(plan) is not tuple:
+            self._recorder.record("citation_reviewer", "failed", "reviewer_preflight_failed")
+            raise AcademicWorkflowServiceError("citation_plan_invalid")
+        outline_id, sections = plan
+        reviews: list[WorkflowSectionCitationReview] = []
+        unavailable = 0
+        user_message = None
+        try:
+            for index, (section_id, source_ids, user_message) in enumerate(sections, 1):
+                await self._emit(_progress("review", f"引用审核 {index}/{len(sections)}"))
+                review = await _reviewer_core._review_one(
+                    _reviewer_core._create_production_citation_reviewer_client,
+                    outline_id=outline_id, section_id=section_id,
+                    cited_source_ids=source_ids, user_message=user_message,
+                )
+                user_message = None
+                if type(review) is WorkflowSectionCitationReview:
+                    code = None
+                elif review is _reviewer_core._RESPONSE_FAILURE:
+                    code = "reviewer_response_invalid"
+                elif review is _reviewer_core._EXECUTION_FAILURE:
+                    code = "reviewer_execution_failed"
+                elif review is _reviewer_core._CONTRACT_FAILURE:
+                    code = "reviewer_contract_failed"
+                else:
+                    raise AcademicWorkflowServiceError("citation_review_result_invalid")
+                if code is not None:
+                    unavailable += 1
+                    logger.warning("Academic citation review unavailable: section=%s code=%s", section_id, code)
+                    review = WorkflowSectionCitationReview(
+                        outline_id=outline_id, section_id=section_id,
+                        cited_source_ids=source_ids, verdict="uncertain",
+                        issues=("insufficient_evidence",), attempt=1,
+                        rationale=(
+                            f"自动引用审核未完成（{code}）。这是系统待人工核查标记，"
+                            "不是模型审核结论，也不代表证据确实不足。正文已保留；"
+                            "请对照引用审计核查，或提出修订意见后复审。"
+                        ),
+                    )
+                self._recorder.record(
+                    "citation_review_section", "unavailable" if code else "completed",
+                    code, section_id=section_id,
+                )
+                reviews.append(review)
+            if unavailable:
+                await self._emit(_progress(
+                    "human_review", f"草稿已保留；{unavailable} 节自动审核未完成，需人工核查",
+                ))
+            return tuple(reviews)
+        finally:
+            # Do not retain evidence-bearing prompt aliases on failed/cancelled frames.
+            del plan, sections, user_message
 
 
 class _ObservedReviewer:
@@ -345,10 +481,11 @@ class _ObservedReviewer:
 
 class _ObservedProductionComposer:
     def __init__(
-        self, recorder: _SafeRunRecorder, emit: SafeEmitter
+        self, recorder: _SafeRunRecorder, emit: SafeEmitter, output_dir: Path,
     ) -> None:
         self._recorder = recorder
         self._emit = emit
+        self._output_dir = output_dir
 
     async def compose(
         self, state: AcademicWorkflowState
@@ -361,9 +498,10 @@ class _ObservedProductionComposer:
                 section_writer=_PreparedSectionWriter(writer_state)
             ),
             self._recorder,
+            self._output_dir,
         )
         reviewer = _ObservedReviewer(
-            GPTResearcherCitationReviewerAdapter(), self._recorder, self._emit
+            _WebCitationReviewer(self._recorder, self._emit), self._recorder, self._emit
         )
         composer = GPTResearcherAcademicDraftComposer(
             section_writer_sequence=sequence,
@@ -381,6 +519,28 @@ class _ObservedProductionComposer:
         return composition
 
 
+class _CapturingComposer:
+    """Retain editable drafts without expanding LangGraph's minimal outcome DTO."""
+
+    def __init__(self, delegate: _Composer) -> None:
+        self.delegate = delegate
+        self.result: WorkflowAcademicDraftComposition | None = None
+
+    async def compose(self, state: AcademicWorkflowState) -> WorkflowAcademicDraftComposition:
+        self.result = await self.delegate.compose(state)
+        return self.result
+
+
+@dataclass
+class _DraftVersion:
+    composition: WorkflowAcademicDraftComposition
+    parent: int | None
+    selected: tuple[str, ...] = ()
+    feedback: str = ""
+    section_feedback: dict[str, str] = field(default_factory=dict)
+    decision: str = "pending"
+
+
 @dataclass
 class _AcademicSession:
     session_id: str
@@ -394,6 +554,10 @@ class _AcademicSession:
     status: str = "starting"
     revision_used: bool = False
     human_exported: bool = False
+    versions: dict[int, _DraftVersion] = field(default_factory=dict)
+    current_version: int = 0
+    pending_version: int | None = None
+    revision_requests: dict[str, int] = field(default_factory=dict)
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -443,6 +607,41 @@ def _section_writer_execution_state(
     return AcademicWorkflowState.model_validate_json(
         _canonical_bytes(state_payload), strict=True
     )
+
+
+def _revision_evidence_blocks(
+    state: AcademicWorkflowState,
+    source_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Project bounded provenance only for the section's existing citations."""
+
+    evidence = state.research_evidence
+    if (
+        evidence is None
+        or type(source_ids) is not tuple
+        or not source_ids
+        or len(set(source_ids)) != len(source_ids)
+    ):
+        raise AcademicWorkflowServiceError("revision_failed")
+    provenance_by_id = {entry.source_id: entry for entry in evidence.provenance}
+    blocks: list[str] = []
+    for source_id in source_ids:
+        entry = provenance_by_id.get(source_id)
+        if entry is None:
+            raise AcademicWorkflowServiceError("revision_failed")
+        blocks.extend(entry.evidence_blocks)
+
+    projected: list[str] = []
+    remaining = _REVISION_CONTEXT_TOTAL_MAX_CHARS
+    for block in blocks:
+        if len(projected) == _REVISION_CONTEXT_MAX_COUNT or remaining == 0:
+            break
+        take = min(len(block), _REVISION_CONTEXT_MAX_CHARS, remaining)
+        projected.append(block[:take])
+        remaining -= take
+    if not projected:
+        raise AcademicWorkflowServiceError("revision_failed")
+    return tuple(projected)
 
 
 def _draft_citation_preflight(
@@ -904,8 +1103,8 @@ class AcademicWorkflowService:
                 actor_assertion="web academic workflow explicit decision",
             )
             if decision == "approve":
-                composer = (
-                    _ObservedProductionComposer(session.recorder, emit)
+                composer = _CapturingComposer(
+                    _ObservedProductionComposer(session.recorder, emit, session.output_dir)
                     if self._composer_factory is None
                     else self._composer_factory()
                 )
@@ -937,6 +1136,8 @@ class AcademicWorkflowService:
                 logger.exception("Academic workflow decision failed")
                 raise AcademicWorkflowServiceError("decision_failed") from None
             session.state = terminal
+            if isinstance(composer, _CapturingComposer):
+                session.composition = composer.result
             session.recorder.record("outline_decision", "completed")
             if terminal.phase == "outline_rejected":
                 session.status = "rejected"
@@ -960,6 +1161,7 @@ class AcademicWorkflowService:
     ) -> None:
         outcome = state.outcome
         if state.phase == "draft_ready" and outcome is not None and outcome.outcome_type == "draft_ready":
+            self._ensure_versions(session)
             _atomic_write(session.output_dir / "final-report.md", outcome.referenced_draft.content)
             session.status = "draft_ready"
             await emit(_progress("complete", "完成"))
@@ -973,6 +1175,7 @@ class AcademicWorkflowService:
                     "reference_count": len(outcome.referenced_draft.reference_source_ids),
                     "markdown": outcome.referenced_draft.content,
                     "url": _artifact_url(session.session_id, "final-report.md"),
+                    "draft_workspace": self._workspace(session),
                 }
             )
             return
@@ -982,6 +1185,7 @@ class AcademicWorkflowService:
         composition = _composition_from_review_state(state)
         session.composition = composition
         session.status = "review_required"
+        self._ensure_versions(session)
         await self._save_review_artifacts(session, composition)
         await emit(_progress("human_review", "人工复核"))
         await emit(self._review_message(session, composition))
@@ -1018,23 +1222,257 @@ class AcademicWorkflowService:
             "draft_url": _artifact_url(session.session_id, "final-report-draft.md"),
             "audit_markdown_url": _artifact_url(session.session_id, "citation-audit.md"),
             "audit_json_url": _artifact_url(session.session_id, "citation-audit.json"),
+            "draft_workspace": self._workspace(session),
         }
+
+    def _version_url(self, session: _AcademicSession, version: int, filename: str) -> str:
+        return f"/outputs/academic/{session.session_id}/versions/v{version:04d}/{filename}"
+
+    def _save_version(self, session: _AcademicSession, number: int, version: _DraftVersion) -> None:
+        if session.state is None:
+            raise AcademicWorkflowServiceError("state_invalid")
+        target = session.output_dir / "versions" / f"v{number:04d}"
+        target.mkdir(parents=True, exist_ok=True)
+        composition = version.composition
+        execution = _execution_state(session.state)
+        merged = merge_sections(execution, composition.drafts)
+        _atomic_write(target / "draft.md", _human_export(session.state, composition, merged.content))
+        _atomic_json(target / "composition.json", composition.model_dump(mode="json"))
+        _atomic_json(target / "feedback.json", {
+            "parent_version": version.parent,
+            "section_ids": list(version.selected),
+            "feedback": version.feedback,
+            "section_feedback": version.section_feedback,
+        })
+        audit_markdown, audit_json = _citation_audit(session.state, composition)
+        _atomic_write(target / "citation-audit.md", audit_markdown)
+        _atomic_json(target / "citation-audit.json", audit_json)
+
+    def _save_version_index(self, session: _AcademicSession) -> None:
+        _atomic_json(session.output_dir / "versions.json", {
+            "current_version": session.current_version,
+            "pending_version": session.pending_version,
+            "versions": [
+                {"version": number, "parent_version": item.parent, "decision": item.decision}
+                for number, item in session.versions.items()
+            ],
+        })
+
+    def _ensure_versions(self, session: _AcademicSession) -> None:
+        if session.current_version or session.composition is None:
+            return
+        version = _DraftVersion(session.composition, None, decision="accepted")
+        self._save_version(session, 1, version)
+        session.versions[1] = version
+        session.current_version = 1
+        self._save_version_index(session)
+
+    def _workspace(self, session: _AcademicSession) -> dict[str, object] | None:
+        if not session.current_version or session.state is None or session.state.outline is None:
+            return None
+        titles = {section.section_id: section.title for section in session.state.outline.sections}
+
+        def sections(version: _DraftVersion) -> list[dict[str, object]]:
+            return [
+                {"section_id": draft.section_id, "title": titles[draft.section_id],
+                 "content": draft.content, "verdict": review.verdict,
+                 "issues": list(review.issues), "rationale": review.rationale}
+                for draft, review in zip(version.composition.drafts, version.composition.reviews)
+            ]
+
+        current = session.versions[session.current_version]
+        pending = session.versions.get(session.pending_version)
+        return {
+            "session_id": session.session_id,
+            "current_version": session.current_version,
+            "machine_ready": current.composition.disposition.disposition == "ready",
+            "sections": sections(current),
+            "versions": [
+                {"version": number, "parent_version": item.parent, "decision": item.decision,
+                 "draft_url": self._version_url(session, number, "draft.md"),
+                 "audit_url": self._version_url(session, number, "citation-audit.md")}
+                for number, item in session.versions.items()
+            ],
+            "pending": None if pending is None else {
+                "version": session.pending_version, "parent_version": pending.parent,
+                "section_ids": list(pending.selected), "feedback": pending.feedback,
+                "section_feedback": pending.section_feedback,
+                "machine_ready": pending.composition.disposition.disposition == "ready",
+                "sections": sections(pending),
+            },
+        }
+
+    async def draft_state(self, payload: object, emit: SafeEmitter) -> None:
+        values = _exact_payload(payload, frozenset({"session_id"}))
+        session = self._session(_safe_session_id(values))
+        async with session.lock:
+            await emit({"type": "academic_draft_updated", "draft_workspace": self._workspace(session)})
+
+    async def revise(self, payload: object, emit: SafeEmitter) -> None:
+        # Keep the previous client command valid; new clients use explicit feedback.
+        if type(payload) is dict and set(payload) == {"session_id"}:
+            await self._legacy_revise(payload, emit)
+            return
+        values = _exact_payload(payload, frozenset({
+            "session_id", "base_version", "request_id", "section_ids", "feedback", "section_feedback"
+        }))
+        session = self._session(_safe_session_id(values))
+        base = values["base_version"]
+        request_id = values["request_id"]
+        selected = values["section_ids"]
+        feedback = values["feedback"]
+        section_feedback = values["section_feedback"]
+        if (type(base) is not int or base < 1 or type(request_id) is not str
+                or re.fullmatch(r"[A-Za-z0-9-]{16,64}", request_id) is None):
+            raise AcademicWorkflowServiceError("invalid_request")
+        if (type(selected) is not list or not 1 <= len(selected) <= 10
+                or any(type(item) is not str for item in selected)
+                or len(set(selected)) != len(selected)):
+            raise AcademicWorkflowServiceError("invalid_sections")
+        if (type(feedback) is not str or len(feedback) > 4000
+                or type(section_feedback) is not dict
+                or any(type(key) is not str or key not in selected or type(value) is not str
+                       or len(value) > 2000 for key, value in section_feedback.items())
+                or len(feedback) + sum(len(value) for value in section_feedback.values()) > 12000):
+            raise AcademicWorkflowServiceError("invalid_feedback")
+        feedback = feedback.strip()
+        section_feedback = {key: value.strip() for key, value in section_feedback.items()}
+        if any(not feedback and not section_feedback.get(key) for key in selected):
+            raise AcademicWorkflowServiceError("invalid_feedback")
+        async with session.lock:
+            if session.composition is None or session.state is None or not session.current_version:
+                raise AcademicWorkflowServiceError("revision_unavailable")
+            section_ids = tuple(draft.section_id for draft in session.composition.drafts)
+            if not set(selected).issubset(section_ids):
+                raise AcademicWorkflowServiceError("invalid_sections")
+            selected_ids = tuple(key for key in section_ids if key in selected)
+            if request_id in session.revision_requests:
+                previous = session.versions[session.revision_requests[request_id]]
+                if (previous.parent != base or previous.selected != selected_ids
+                        or previous.feedback != feedback or previous.section_feedback != section_feedback):
+                    raise AcademicWorkflowServiceError("revision_request_conflict")
+                await emit({"type": "academic_revision_preview", "draft_workspace": self._workspace(session)})
+                return
+            if base != session.current_version:
+                raise AcademicWorkflowServiceError("stale_version")
+            if session.pending_version is not None:
+                raise AcademicWorkflowServiceError("revision_pending")
+            previous_status = session.status
+            previous = session.composition
+            session.status = "revising"
+            number = max(session.versions) + 1
+            try:
+                session.recorder.record("feedback_revision", "started")
+                await emit(_progress("writing", "按人工意见修订"))
+                execution = _execution_state(session.state)
+                writer_state = _section_writer_execution_state(execution)
+                drafts = list(previous.drafts)
+                for index, draft in enumerate(previous.drafts):
+                    if draft.section_id not in selected_ids:
+                        continue
+                    original_ids = previous.gate_result.cited_source_ids_by_section[index]
+                    writer = self._revision_writer(
+                        draft, previous.reviews[index], original_ids,
+                        _revision_evidence_blocks(execution, original_ids),
+                        (feedback, section_feedback.get(draft.section_id, "")),
+                    )
+                    updated = await writer.write_section(writer_state, draft.section_id)
+                    cited = _extract_citations(updated.content, original_ids)
+                    if (updated.section_id != draft.section_id or updated.outline_id != draft.outline_id
+                            or type(cited) is not tuple or not cited):
+                        raise AcademicWorkflowServiceError("revision_failed")
+                    drafts[index] = updated
+                result_drafts = tuple(drafts)
+                gate = gate_citation_evidence(execution, result_drafts)
+                await emit(_progress("review", "修订后引用复审"))
+                reviewer = (_WebCitationReviewer(session.recorder, emit) if self._reviewer_factory is None
+                            else self._reviewer_factory())
+                reviews = await reviewer.review_citations(execution, result_drafts, gate)
+                disposition = gate_citation_review_disposition(gate, reviews)
+                merged = referenced = None
+                if disposition.disposition == "ready":
+                    merged = merge_sections(execution, result_drafts)
+                    referenced = render_references(execution, merged, gate, disposition)
+                candidate = _DraftVersion(
+                    WorkflowAcademicDraftComposition(
+                        drafts=result_drafts, gate_result=gate, reviews=reviews,
+                        disposition=disposition, merged_draft=merged, referenced_draft=referenced,
+                    ), base, selected_ids, feedback, section_feedback,
+                )
+                self._save_version(session, number, candidate)
+                session.versions[number] = candidate
+                session.pending_version = number
+                session.revision_requests[request_id] = number
+                session.recorder.record("feedback_revision", "completed")
+                self._save_version_index(session)
+            except BaseException as exc:
+                session.versions.pop(number, None)
+                session.revision_requests.pop(request_id, None)
+                session.pending_version = None
+                session.status = previous_status
+                if isinstance(exc, asyncio.CancelledError):
+                    session.recorder.record("feedback_revision", "cancelled")
+                    raise
+                if not isinstance(exc, Exception):
+                    raise
+                session.recorder.record("feedback_revision", "failed", "revision_failed")
+                raise AcademicWorkflowServiceError("revision_failed") from None
+            session.status = previous_status
+            # A delivery failure must not discard a completed, paid candidate.
+            await emit(_progress("human_review", "比较并选择版本"))
+            await emit({"type": "academic_revision_preview", "draft_workspace": self._workspace(session)})
+
+    async def revision_decision(self, payload: object, emit: SafeEmitter) -> None:
+        values = _exact_payload(payload, frozenset({"session_id", "base_version", "version", "decision"}))
+        session = self._session(_safe_session_id(values))
+        number, base, decision = values["version"], values["base_version"], values["decision"]
+        if (type(number) is not int or type(base) is not int
+                or type(decision) is not str or decision not in ("accept", "discard")):
+            raise AcademicWorkflowServiceError("invalid_request")
+        async with session.lock:
+            version = session.versions.get(number)
+            expected_decision = "accepted" if decision == "accept" else "discarded"
+            if version is not None and version.parent == base and version.decision == expected_decision:
+                await emit({"type": "academic_draft_updated", "draft_workspace": self._workspace(session)})
+                return
+            if base != session.current_version or version is None or session.pending_version != number:
+                raise AcademicWorkflowServiceError("stale_version")
+            version.decision = expected_decision
+            session.pending_version = None
+            if decision == "accept":
+                session.current_version = number
+            try:
+                self._save_version_index(session)
+            except Exception:
+                session.current_version = base
+                session.pending_version = number
+                version.decision = "pending"
+                raise AcademicWorkflowServiceError("revision_decision_failed") from None
+            if decision == "accept":
+                session.composition = version.composition
+                session.revision_used = False
+                session.human_exported = False
+                session.status = ("draft_ready" if version.composition.disposition.disposition == "ready"
+                                  else "review_required")
+            await emit({"type": "academic_draft_updated", "draft_workspace": self._workspace(session)})
 
     def _revision_writer(
         self,
         draft: WorkflowSectionDraft,
         review: WorkflowSectionCitationReview,
         original_ids: tuple[str, ...],
+        evidence_blocks: tuple[str, ...],
+        feedback: tuple[str, str] | None = None,
     ) -> _Writer:
         if self._writer_factory is not None:
             return self._writer_factory(draft, review, original_ids)
         return GPTResearcherSectionWriterAdapter(
             section_writer_client_factory=_RevisionClientFactory(
-                draft, review, original_ids
+                draft, review, original_ids, evidence_blocks, feedback
             )
         )
 
-    async def revise(self, payload: object, emit: SafeEmitter) -> None:
+    async def _legacy_revise(self, payload: object, emit: SafeEmitter) -> None:
         values = _exact_payload(payload, frozenset({"session_id"}))
         session_id = _safe_session_id(values)
         session = self._session(session_id)
@@ -1047,98 +1485,152 @@ class AcademicWorkflowService:
                 raise AcademicWorkflowServiceError("revision_unavailable")
             if session.revision_used:
                 raise AcademicWorkflowServiceError("revision_already_used")
-            session.revision_used = True
+            if session.pending_version is not None:
+                raise AcademicWorkflowServiceError("revision_pending")
+
+            previous_composition = session.composition
+            previous_version = session.current_version
+            number = max(session.versions, default=0) + 1
             session.status = "revising"
-            await emit(_progress("writing", "逐节写作"))
-            composition = session.composition
-            execution = _execution_state(session.state)
-            revised = list(composition.drafts)
             try:
-                for index, review in enumerate(composition.reviews):
+                session.recorder.record("revision", "started")
+                await emit(_progress("writing", "逐节写作"))
+                execution = _execution_state(session.state)
+                revised = list(previous_composition.drafts)
+                for index, review in enumerate(previous_composition.reviews):
                     if review.verdict == "supported":
                         continue
-                    original_ids = composition.gate_result.cited_source_ids_by_section[index]
+                    original_ids = (
+                        previous_composition.gate_result.cited_source_ids_by_section[index]
+                    )
+                    evidence_blocks = _revision_evidence_blocks(execution, original_ids)
                     writer = self._revision_writer(
-                        composition.drafts[index], review, original_ids
+                        previous_composition.drafts[index],
+                        review,
+                        original_ids,
+                        evidence_blocks,
                     )
                     draft = await writer.write_section(execution, review.section_id)
                     cited = _extract_citations(draft.content, original_ids)
                     if type(cited) is not tuple or not cited:
                         raise AcademicWorkflowServiceError("revision_failed")
                     revised[index] = draft
+
                 drafts = tuple(revised)
                 gate = gate_citation_evidence(execution, drafts)
                 reviewer = (
-                    GPTResearcherCitationReviewerAdapter()
+                    _WebCitationReviewer(session.recorder, emit)
                     if self._reviewer_factory is None
                     else self._reviewer_factory()
                 )
                 await emit(_progress("review", "引用审核"))
                 reviews = await reviewer.review_citations(execution, drafts, gate)
                 disposition = gate_citation_review_disposition(gate, reviews)
+
+                merged = referenced = None
                 if disposition.disposition == "ready":
                     merged = merge_sections(execution, drafts)
                     referenced = render_references(
                         execution, merged, gate, disposition
                     )
-                    updated = WorkflowAcademicDraftComposition(
-                        drafts=drafts,
-                        gate_result=gate,
-                        reviews=reviews,
-                        disposition=disposition,
-                        merged_draft=merged,
-                        referenced_draft=referenced,
-                    )
-                    session.composition = updated
-                    session.status = "draft_ready"
-                    _atomic_write(
-                        session.output_dir / "final-report.md", referenced.content
-                    )
-                    await emit(_progress("complete", "完成"))
-                    await emit(
-                        {
-                            "type": "academic_ready",
-                            "session_id": session.session_id,
-                            "phase": "draft_ready",
-                            "status": "completed",
-                            "section_count": len(drafts),
-                            "reference_count": len(referenced.reference_source_ids),
-                            "markdown": referenced.content,
-                            "url": _artifact_url(
-                                session.session_id, "final-report.md"
-                            ),
-                            "revision_used": True,
-                        }
-                    )
-                    return
                 updated = WorkflowAcademicDraftComposition(
                     drafts=drafts,
                     gate_result=gate,
                     reviews=reviews,
                     disposition=disposition,
-                    merged_draft=None,
-                    referenced_draft=None,
+                    merged_draft=merged,
+                    referenced_draft=referenced,
                 )
-                session.composition = updated
-                session.status = "review_required"
-                await self._save_review_artifacts(session, updated)
-                await emit(_progress("human_review", "人工复核"))
-                await emit(self._review_message(session, updated))
+                report = None
+                if referenced is not None:
+                    report = _human_export(session.state, updated, merged.content)
+                    _atomic_write(session.output_dir / "final-report.md", report)
+                else:
+                    await self._save_review_artifacts(session, updated)
+                version = _DraftVersion(
+                    updated, previous_version or None,
+                    tuple(review.section_id for review in previous_composition.reviews
+                          if review.verdict != "supported"),
+                    decision="accepted",
+                )
+                self._save_version(session, number, version)
+                session.versions[number] = version
+                session.current_version = number
+                session.recorder.record("revision", "completed")
+                self._save_version_index(session)
             except asyncio.CancelledError:
-                session.status = "revision_failed"
-                raise
-            except AcademicWorkflowServiceError:
-                session.status = "revision_failed"
+                session.versions.pop(number, None)
+                session.current_version = previous_version
+                session.composition = previous_composition
+                session.revision_used = False
+                session.status = "review_required"
+                session.recorder.record("revision", "cancelled")
                 raise
             except Exception:
-                session.status = "revision_failed"
+                session.versions.pop(number, None)
+                session.current_version = previous_version
+                session.composition = previous_composition
+                session.revision_used = False
+                session.status = "review_required"
+                session.recorder.record("revision", "failed", "revision_failed")
                 raise AcademicWorkflowServiceError("revision_failed") from None
+            # Legacy clients auto-adopt, but their result still participates in versioning.
+            # Delivery failure must not undo an already saved paid revision.
+            session.composition = updated
+            session.revision_used = True
+            session.human_exported = False
+            session.status = "draft_ready" if referenced is not None else "review_required"
+            if referenced is not None:
+                await emit(_progress("complete", "完成"))
+                await emit({
+                    "type": "academic_ready", "session_id": session.session_id,
+                    "phase": "draft_ready", "status": "completed",
+                    "section_count": len(drafts),
+                    "reference_count": len(referenced.reference_source_ids),
+                    "markdown": report,
+                    "url": _artifact_url(session.session_id, "final-report.md"),
+                    "revision_used": True, "draft_workspace": self._workspace(session),
+                })
+            else:
+                await emit(_progress("human_review", "人工复核"))
+                await emit(self._review_message(session, updated))
 
     async def export(self, payload: object, emit: SafeEmitter) -> None:
-        values = _exact_payload(payload, frozenset({"session_id"}))
+        fields = {"session_id", "version"} if type(payload) is dict and "version" in payload else {"session_id"}
+        values = _exact_payload(payload, frozenset(fields))
         session_id = _safe_session_id(values)
         session = self._session(session_id)
         async with session.lock:
+            if session.current_version:
+                if "version" in values and (
+                    type(values["version"]) is not int or values["version"] != session.current_version
+                ):
+                    raise AcademicWorkflowServiceError("stale_version")
+                if session.pending_version is not None:
+                    raise AcademicWorkflowServiceError("revision_pending")
+                if session.state is None or session.composition is None:
+                    raise AcademicWorkflowServiceError("export_unavailable")
+                composition = session.composition
+                ready = composition.disposition.disposition == "ready"
+                merged = merge_sections(_execution_state(session.state), composition.drafts)
+                report = _human_export(session.state, composition, merged.content)
+                target = session.output_dir / "versions" / f"v{session.current_version:04d}"
+                _atomic_write(target / "final-report.md", report)
+                _atomic_json(target / "export-info.json", {
+                    "version": session.current_version, "machine_disposition_ready": ready,
+                    "basis": "machine_ready" if ready else "explicit_human_confirmation",
+                })
+                _atomic_write(session.output_dir / "final-report.md", report)
+                session.human_exported = not ready
+                session.status = "draft_ready" if ready else "manual_final"
+                await emit({
+                    "type": "academic_final", "session_id": session.session_id,
+                    "result": "machine_ready_export" if ready else "human_confirmed_export",
+                    "machine_disposition_ready": ready, "markdown": report,
+                    "url": self._version_url(session, session.current_version, "final-report.md"),
+                    "draft_workspace": self._workspace(session),
+                })
+                return
             if session.human_exported:
                 await emit(
                     {

@@ -6,83 +6,29 @@
     <meta name="description" content="A research assistant powered by GPT-4">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="icon" href="./static/favicon.ico">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;700&display=swap" rel="stylesheet">
     <link href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <link rel="stylesheet" href="/site/styles.css" />
-    <style>
-        .avatar {
-            width: 80px;
-            height: 80px;
-            border-radius: 50%;
-        }
-
-        .agent-name {
-            text-align: center;
-        }
-
-        .agent-item {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-        }
-
-        .agent-choices {
-            display: none;
-        }
-
-        .btn-show {
-            display: none;
-        }
-
-        /* Icon button style for inline buttons */
-        .icon-button {
-            background: none;
-            border: none;
-            cursor: pointer;
-            padding: 5px;
-            margin-left: 5px;
-            border-radius: 4px;
-            transition: background-color 0.2s, color 0.2s;
-        }
-
-        .icon-button:hover {
-            background-color: rgba(123, 104, 238, 0.1); /* Placeholder, adjust in styles.css */
-        }
-
-        .icon-button:active {
-        }
-
-        /* Ensure buttons are properly aligned in headings */
-        h2 .icon-button, h2 .expand-button {
-            vertical-align: middle;
-            font-size: 0.8em;
-        }
-        
-        /* New navigation buttons in the top-right corner */
-        .nav-buttons {
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            display: flex;
-            gap: 10px;
-            z-index: 100;
-        }
-    </style>
 </head>
 
 <body>
-    <!-- Navigation Buttons (moved from top bar) -->
-    <div class="nav-buttons">
-        <div id="websocketPanelOpenBtn" class="top-websocket-button">
-            <i class="fas fa-network-wired"></i> Status
+    <header class="app-header">
+        <a class="app-brand" href="#form" aria-label="GPT Researcher workspace">
+            <span class="app-brand-mark"><i class="fas fa-flask"></i></span>
+            <span class="app-brand-copy">
+                <strong>GPT Researcher</strong>
+                <small>Research Workbench</small>
+            </span>
+        </a>
+        <div class="nav-buttons" aria-label="Workspace utilities">
+            <div id="websocketPanelOpenBtn" class="top-websocket-button" role="button" tabindex="0">
+                <i class="fas fa-network-wired"></i> Status
+            </div>
+            <div id="historyPanelOpenBtn" class="top-history-button" role="button" tabindex="0">
+                <i class="fas fa-history"></i> History
+            </div>
         </div>
-        <div id="historyPanelOpenBtn" class="top-history-button">
-            <i class="fas fa-history"></i> History
-        </div>
-    </div>
+    </header>
 
     <!-- WebSocket Status Panel -->
     <div class="websocket-panel" id="websocketPanel">
@@ -134,24 +80,30 @@
     </div>
 
     <section class="landing">
-        <div class="max-w-5xl mx-auto text-center">
-            <h1 class="text-4xl font-extrabold mx-auto lg:text-7xl">
+        <div class="landing-content">
+            <span class="landing-eyebrow">AI-powered research workspace</span>
+            <h1>
                 Say Goodbye to <br>
-                <span
-                    style="background-image:linear-gradient(to right, #9867F0, #ED4E50); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">Hours
-                    of Research</span>
+                <span class="gradient-text">Hours of Research</span>
             </h1>
-            <p class="max-w-6xl mx-auto text-gray-600 mt-8" style="font-size:20px">
+            <p class="landing-description">
                 Say Hello to <b>GPT Researcher</b>, your AI mate for rapid insights and comprehensive research. <br>
                 GPT Researcher takes care of everything from accurate source gathering and organization of research results to generation of customized reports with citations.
             </p>
-            <a href="#form" class="btn btn-primary">Start Researching</a>
+            <a href="#form" class="btn btn-primary landing-cta">Start Researching <i class="fas fa-arrow-down"></i></a>
         </div>
     </section>
 
-    <main class="container" id="form">
-        <div class="agent-item"><img src="/static/gptr-logo.png" class="avatar" alt="Auto Agent"></div>
-        <form method="POST" class="mt-3" id="researchForm">
+    <main class="container research-workbench" id="form">
+        <aside class="control-panel">
+            <div class="panel-heading control-panel-heading">
+                <div>
+                    <span class="panel-kicker">Research setup</span>
+                    <h2>Configure your run</h2>
+                </div>
+                <div class="agent-item"><img src="/static/gptr-logo.png" class="avatar" alt="Auto Agent"></div>
+            </div>
+            <form method="POST" class="mt-3" id="researchForm">
             <div class="form-group">
                 <label for="task" class="agent-question">What would you like me to research next?</label>
                 <textarea id="task" name="task" class="form-control highlight-connection" placeholder="Enter any topic, question, or idea..." required autocomplete="on"></textarea>
@@ -295,8 +247,11 @@
                 </div>
             </div>
 
-            <input type="submit" value="Begin Research" class="btn btn-primary button-padding" id="submitButton">
-        </form>
+                <input type="submit" value="Begin Research" class="btn btn-primary button-padding" id="submitButton">
+            </form>
+        </aside>
+
+        <section class="workspace-panel" aria-label="Research results workspace">
 
         <section class="academic-workflow-panel" id="academicWorkflowPanel" hidden aria-live="polite">
             <h2>学术工作流</h2>
@@ -321,23 +276,45 @@
                 <h3>机器引用审核需人工复核</h3>
                 <div id="academicReviewSections"></div>
                 <p class="academic-artifact-links" id="academicArtifactLinks"></p>
-                <div class="academic-actions">
-                    <button type="button" id="academicRevise" class="btn btn-primary">修订一次并复审（产生费用）</button>
-                    <button type="button" id="academicExport" class="btn btn-secondary">人工确认并导出（不调用LLM）</button>
-                </div>
             </div>
             <div id="academicFinalPanel" class="academic-card" hidden>
                 <h3>学术报告已导出</h3>
                 <p class="academic-artifact-links" id="academicFinalLinks"></p>
             </div>
+            <div id="academicRevisionPanel" class="academic-card" hidden>
+                <div class="academic-editor-heading">
+                    <h3>审阅与定向修订</h3>
+                    <span id="academicVersionLabel" class="academic-version-badge"></span>
+                </div>
+                <p>选择要修改的章节，填写总体或逐节意见。机器审核通过的章节也可以修改；未选章节保持原样。</p>
+                <p class="academic-editor-note">依据当前证据改写，不重新检索。新增事实需要证据支持。每轮由你确认付费，候选稿须手动采用。服务重启后会话不保留，请先下载版本。</p>
+                <label for="academicGlobalFeedback">总体修改要求（应用于所选章节）</label>
+                <textarea id="academicGlobalFeedback" maxlength="4000" rows="3" placeholder="例如：减少泛泛描述，按技术路线比较优缺点；证据不足之处说明局限。"></textarea>
+                <div class="academic-actions academic-selection-tools">
+                    <button type="button" id="academicSelectAll" class="btn btn-secondary">选择全部章节</button>
+                    <button type="button" id="academicSelectNone" class="btn btn-secondary">清除选择</button>
+                </div>
+                <div id="academicEditableSections"></div>
+                <p id="academicRevisionNotice" role="status"></p>
+                <div class="academic-actions">
+                    <button type="button" id="academicRevise" class="btn btn-primary">按我的意见修订并复审（产生费用）</button>
+                    <button type="button" id="academicExport" class="btn btn-secondary">人工确认并导出当前版本（不调用LLM）</button>
+                </div>
+                <div id="academicRevisionPreview" hidden>
+                    <h4>候选版本 · 尚未替换当前稿</h4>
+                    <p id="academicCandidateStatus"></p>
+                    <div id="academicRevisionComparison"></div>
+                    <div class="academic-actions">
+                        <button type="button" id="academicAcceptRevision" class="btn btn-primary">采用新版（不调用LLM）</button>
+                        <button type="button" id="academicDiscardRevision" class="btn btn-secondary">保留旧版（不调用LLM）</button>
+                    </div>
+                </div>
+                <details class="academic-version-history">
+                    <summary>版本记录与下载</summary>
+                    <div id="academicVersionHistory"></div>
+                </details>
+            </div>
         </section>
-
-        <!-- Add JSON button above Research Progress section -->
-        <div class="margin-div" id="jsonButtonContainer" style="display: none; text-align: right; margin-bottom: 10px;">
-            <a id="downloadLinkJsonTop" href="#" class="report-action-btn disabled" target="_blank" rel="noopener noreferrer">
-                <i class="fas fa-file-code"></i> JSON
-            </a>
-        </div>
 
         <div class="margin-div research-output-container">
             <!-- Move spinner to the left side of the text -->
@@ -358,17 +335,23 @@
                     <i class="fas fa-expand-alt"></i>
                 </button>
             </h2>
-            <!-- Add download buttons above the report container -->
-            <div class="report-actions" style="display: none;">
-                <a id="downloadLinkTop" href="#" class="report-action-btn disabled" target="_blank" rel="noopener noreferrer">
-                    <i class="fas fa-file-pdf"></i> PDF
-                </a>
-                <a id="downloadLinkWordTop" href="#" class="report-action-btn disabled" target="_blank" rel="noopener noreferrer">
-                    <i class="fas fa-file-word"></i> Word
-                </a>
-                <a id="downloadLinkMdTop" href="#" class="report-action-btn disabled" target="_blank" rel="noopener noreferrer">
-                    <i class="fas fa-file-lines"></i> Markdown
-                </a>
+            <div class="report-toolbar">
+                <div class="report-actions" style="display: none;">
+                    <a id="downloadLinkTop" href="#" class="report-action-btn disabled" target="_blank" rel="noopener noreferrer">
+                        <i class="fas fa-file-pdf"></i> PDF
+                    </a>
+                    <a id="downloadLinkWordTop" href="#" class="report-action-btn disabled" target="_blank" rel="noopener noreferrer">
+                        <i class="fas fa-file-word"></i> Word
+                    </a>
+                    <a id="downloadLinkMdTop" href="#" class="report-action-btn disabled" target="_blank" rel="noopener noreferrer">
+                        <i class="fas fa-file-lines"></i> Markdown
+                    </a>
+                </div>
+                <div id="jsonButtonContainer" style="display: none;">
+                    <a id="downloadLinkJsonTop" href="#" class="report-action-btn disabled" target="_blank" rel="noopener noreferrer">
+                        <i class="fas fa-file-code"></i> JSON
+                    </a>
+                </div>
             </div>
             <div id="reportContainer"></div>
             <div id="reportActions" style="display: none;">
@@ -391,6 +374,7 @@
                 </button>
             </div>
         </div>
+        </section>
 
         <!-- Fixed bottom bar styled like the top credits bar -->
     </main>
