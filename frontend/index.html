@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <title>GPT Researcher</title>
+    <meta name="description" content="A research assistant powered by GPT-4">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" href="./static/favicon.ico">
+    <link href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <link rel="stylesheet" href="/site/styles.css" />
+</head>
+
+<body>
+    <header class="app-header">
+        <a class="app-brand" href="#form" aria-label="GPT Researcher workspace">
+            <span class="app-brand-mark"><i class="fas fa-flask"></i></span>
+            <span class="app-brand-copy">
+                <strong>GPT Researcher</strong>
+                <small>Research Workbench</small>
+            </span>
+        </a>
+        <div class="nav-buttons" aria-label="Workspace utilities">
+            <div id="websocketPanelOpenBtn" class="top-websocket-button" role="button" tabindex="0">
+                <i class="fas fa-network-wired"></i> Status
+            </div>
+            <div id="historyPanelOpenBtn" class="top-history-button" role="button" tabindex="0">
+                <i class="fas fa-history"></i> History
+            </div>
+        </div>
+    </header>
+
+    <!-- WebSocket Status Panel -->
+    <div class="websocket-panel" id="websocketPanel">
+        <div class="websocket-panel-header">
+            <h3><i class="fas fa-plug"></i> Connection Status</h3>
+            <div class="websocket-panel-actions">
+                <button id="websocketPanelToggle" class="websocket-action-btn" title="Close panel">
+                    <i class="fas fa-chevron-left"></i>
+                </button>
+            </div>
+        </div>
+        <div class="websocket-status">
+            <div class="status-item">
+                <span class="status-label">Connection:</span>
+                <span class="status-value" id="connectionStatus">Disconnected</span>
+                <span class="status-indicator" id="connectionIndicator"></span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">Research:</span>
+                <span class="status-value" id="researchStatus">Inactive</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">Connected for:</span>
+                <span class="status-value" id="connectionDuration">-</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">Last activity:</span>
+                <span class="status-value" id="lastActivity">-</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">ReadyState:</span>
+                <span class="status-value" id="readyState">-</span>
+            </div>
+            <div class="status-divider"></div>
+            <div class="status-item">
+                <span class="status-label">Connection attempts:</span>
+                <span class="status-value" id="connectionAttempts">0</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">Messages received:</span>
+                <span class="status-value" id="messagesReceived">0</span>
+            </div>
+            <div class="status-divider"></div>
+            <div class="status-item">
+                <span class="status-label">Current task:</span>
+                <span class="status-value" id="currentTask">-</span>
+            </div>
+        </div>
+    </div>
+
+    <section class="landing">
+        <div class="landing-content">
+            <span class="landing-eyebrow">AI-powered research workspace</span>
+            <h1>
+                Say Goodbye to <br>
+                <span class="gradient-text">Hours of Research</span>
+            </h1>
+            <p class="landing-description">
+                Say Hello to <b>GPT Researcher</b>, your AI mate for rapid insights and comprehensive research. <br>
+                GPT Researcher takes care of everything from accurate source gathering and organization of research results to generation of customized reports with citations.
+            </p>
+            <a href="#form" class="btn btn-primary landing-cta">Start Researching <i class="fas fa-arrow-down"></i></a>
+        </div>
+    </section>
+
+    <main class="container research-workbench" id="form">
+        <aside class="control-panel">
+            <div class="panel-heading control-panel-heading">
+                <div>
+                    <span class="panel-kicker">Research setup</span>
+                    <h2>Configure your run</h2>
+                </div>
+                <div class="agent-item"><img src="/static/gptr-logo.png" class="avatar" alt="Auto Agent"></div>
+            </div>
+            <form method="POST" class="mt-3" id="researchForm">
+            <div class="form-group">
+                <label for="task" class="agent-question">What would you like me to research next?</label>
+                <textarea id="task" name="task" class="form-control highlight-connection" placeholder="Enter any topic, question, or idea..." required autocomplete="on"></textarea>
+                <input type="radio" name="agent" id="autoAgent" value="Auto Agent" checked hidden>
+            </div>
+            <div class="form-group">
+                <div class="row">
+
+
+                </div>
+                <button type="button" id="btnShowAuto" class="btn btn-secondary mt-3 btn-show">Auto Agent</button>
+            </div>
+            <div class="form-group">
+                <label for="report_type" class="agent-question">What type of report would you like me to
+                    generate?</label>
+                <select name="report_type" id="report_type" class="form-control highlight-connection" required>
+                    <option value="research_report">Summary - Short and fast (~2 min)</option>
+                    <option value="detailed_report">Detailed - In depth and longer (~5 min)</option>
+                    <option value="resource_report">Resource Report</option>
+                    <option value="deep">Deep Research</option>
+                    <option value="academic_langgraph">学术固定报告（LangGraph）</option>
+                </select>
+            </div>
+            <div class="form-group academic-profile-options" id="academicProfileOptions" hidden>
+                <label for="academicProfile" class="agent-question">选择固定学术报告结构</label>
+                <select id="academicProfile" class="form-control highlight-connection">
+                    <option value="stem_literature_review">STEM文献综述</option>
+                    <option value="technical_route_survey">技术路线调研</option>
+                    <option value="method_comparison">方法比较</option>
+                    <option value="equipment_material_selection">设备/材料选型</option>
+                    <option value="proposal_research_status">开题研究现状</option>
+                    <option value="systematic_literature_review">系统文献综述</option>
+                </select>
+                <p class="academic-fixed-info">正文与目录 locale：zh-CN；检索器由服务器配置。</p>
+            </div>
+            <div class="form-group">
+                <label for="tone" class="agent-question">In which tone would you like the report to be
+                    generated?</label>
+                <select name="tone" id="tone" class="form-control highlight-connection" required>
+                    <option value="Objective">Objective - Impartial and unbiased presentation of facts and findings
+                    </option>
+                    <option value="Formal">Formal - Adheres to academic standards with sophisticated language and
+                        structure</option>
+                    <option value="Analytical">Analytical - Critical evaluation and detailed examination of data and
+                        theories</option>
+                    <option value="Persuasive">Persuasive - Convincing the audience of a particular viewpoint or
+                        argument</option>
+                    <option value="Informative">Informative - Providing clear and comprehensive information on a topic
+                    </option>
+                    <option value="Explanatory">Explanatory - Clarifying complex concepts and processes</option>
+                    <option value="Descriptive">Descriptive - Detailed depiction of phenomena, experiments, or case
+                        studies</option>
+                    <option value="Critical">Critical - Judging the validity and relevance of the research and its
+                        conclusions</option>
+                    <option value="Comparative">Comparative - Juxtaposing different theories, data, or methods to
+                        highlight differences and similarities</option>
+                    <option value="Speculative">Speculative - Exploring hypotheses and potential implications or future
+                        research directions</option>
+                    <option value="Reflective">Reflective - Considering the research process and personal insights or
+                        experiences</option>
+                    <option value="Narrative">Narrative - Telling a story to illustrate research findings or
+                        methodologies</option>
+                    <option value="Humorous">Humorous - Light-hearted and engaging, usually to make the content more
+                        relatable</option>
+                    <option value="Optimistic">Optimistic - Highlighting positive findings and potential benefits
+                    </option>
+                    <option value="Pessimistic">Pessimistic - Focusing on limitations, challenges, or negative outcomes
+                    </option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="report_source" class="agent-question">What sources would you like me to research
+                    from?</label>
+                <p class="text-left mt-0 pt-0" style="font-size: 0.7rem;">You can now do research on local documents as
+                    well. Please make sure to add the DOC_PATH env variable pointing to your documents folder.</p>
+                <select name="report_source" id="report_source" class="form-control highlight-connection" required>
+                    <option value="web">The Web</option>
+                    <option value="local">My Documents</option>
+                    <option value="hybrid">Hybrid</option>
+                    <option value="azure">Azure storage</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="maxSearchResults" class="agent-question">How many websites should be scraped per query?</label>
+                <input type="number" class="form-control highlight-connection" id="maxSearchResults" name="max_search_results" min="1" max="20" value="5">
+                <small class="text-muted">Controls the number of websites scraped per search query (default: 5)</small>
+            </div>
+            <div class="form-group">
+                <label for="queryDomains" class="form-label">Query Domains (Optional)</label>
+                <input type="text" class="form-control highlight-connection" id="queryDomains" name="query_domains" placeholder="Enter domains separated by commas" autocomplete="on">
+                <small class="text-muted">Example: techcrunch.com, forbes.com</small>
+            </div>
+
+            <!-- MCP Configuration Section -->
+            <div class="form-group">
+                <div class="mcp-section">
+                    <div class="mcp-header">
+                        <label for="mcpEnabled" class="form-label">
+                            <input type="checkbox" id="mcpEnabled" name="mcp_enabled" class="mcp-toggle">
+                            Enable MCP (Model Context Protocol)
+                        </label>
+                        <button type="button" id="mcpInfoBtn" class="mcp-info-btn" title="Learn about MCP">
+                            <i class="fas fa-info-circle"></i>
+                        </button>
+                    </div>
+                    <small class="text-muted">Connect to external tools and data sources through MCP servers</small>
+                    
+                    <div id="mcpConfigSection" class="mcp-config-section" style="display: none;">
+                        <div class="mcp-presets">
+                            <label class="form-label">Quick Presets</label>
+                            <div class="preset-buttons">
+                                <button type="button" class="btn btn-outline-secondary btn-sm preset-btn" data-preset="github">
+                                    <i class="fab fa-github"></i> GitHub
+                                </button>
+                                <button type="button" class="btn btn-outline-secondary btn-sm preset-btn" data-preset="tavily">
+                                    <i class="fas fa-search"></i> Tavily Web Search
+                                </button>
+                                <button type="button" class="btn btn-outline-secondary btn-sm preset-btn" data-preset="filesystem">
+                                    <i class="fas fa-folder"></i> Local Files
+                                </button>
+                            </div>
+                            <small class="text-muted">Click a preset to add pre-configured MCP servers to the JSON below</small>
+                        </div>
+
+                        <div class="mcp-config-group">
+                            <label for="mcpConfig" class="form-label">MCP Servers Configuration</label>
+                            <textarea id="mcpConfig" name="mcp_config" class="form-control mcp-config-textarea" rows="8" placeholder="Paste your MCP servers configuration as JSON array...">[]</textarea>
+                            <div class="mcp-config-status">
+                                <span id="mcpConfigStatus" class="mcp-status-text">Valid JSON ✓</span>
+                                <button type="button" id="mcpFormatBtn" class="btn btn-sm btn-secondary">
+                                    <i class="fas fa-code"></i> Format JSON
+                                </button>
+                            </div>
+                            <small class="text-muted">
+                                Paste your MCP servers configuration as a JSON array. Each server should have properties like 
+                                <code>name</code>, <code>command</code>, <code>args</code>, and optional <code>env</code> variables.
+                                <a href="#" id="mcpExampleLink">See example →</a>
+                            </small>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+                <input type="submit" value="Begin Research" class="btn btn-primary button-padding" id="submitButton">
+            </form>
+        </aside>
+
+        <section class="workspace-panel" aria-label="Research results workspace">
+
+        <section class="academic-workflow-panel" id="academicWorkflowPanel" hidden aria-live="polite">
+            <h2>学术工作流</h2>
+            <ol class="academic-stages" id="academicStages">
+                <li data-stage="planning">规划</li>
+                <li data-stage="evidence">证据检索</li>
+                <li data-stage="outline">目录生成</li>
+                <li data-stage="approval">等待审批</li>
+                <li data-stage="writing">逐节写作</li>
+                <li data-stage="review">引用审核</li>
+                <li data-stage="human_review">人工复核/完成</li>
+            </ol>
+            <div id="academicOutlinePanel" class="academic-card" hidden>
+                <h3 id="academicOutlineTitle"></h3>
+                <ol id="academicOutlineSections"></ol>
+                <div class="academic-actions">
+                    <button type="button" id="academicApprove" class="btn btn-primary">批准目录</button>
+                    <button type="button" id="academicReject" class="btn btn-secondary">拒绝</button>
+                </div>
+            </div>
+            <div id="academicReviewPanel" class="academic-card" hidden>
+                <h3>机器引用审核需人工复核</h3>
+                <div id="academicReviewSections"></div>
+                <p class="academic-artifact-links" id="academicArtifactLinks"></p>
+            </div>
+            <div id="academicFinalPanel" class="academic-card" hidden>
+                <h3>学术报告已导出</h3>
+                <p class="academic-artifact-links" id="academicFinalLinks"></p>
+            </div>
+            <div id="academicRevisionPanel" class="academic-card" hidden>
+                <div class="academic-editor-heading">
+                    <h3>审阅与定向修订</h3>
+                    <span id="academicVersionLabel" class="academic-version-badge"></span>
+                </div>
+                <p>选择要修改的章节，填写总体或逐节意见。机器审核通过的章节也可以修改；未选章节保持原样。</p>
+                <p class="academic-editor-note">依据当前证据改写，不重新检索。新增事实需要证据支持。每轮由你确认付费，候选稿须手动采用。服务重启后会话不保留，请先下载版本。</p>
+                <label for="academicGlobalFeedback">总体修改要求（应用于所选章节）</label>
+                <textarea id="academicGlobalFeedback" maxlength="4000" rows="3" placeholder="例如：减少泛泛描述，按技术路线比较优缺点；证据不足之处说明局限。"></textarea>
+                <div class="academic-actions academic-selection-tools">
+                    <button type="button" id="academicSelectAll" class="btn btn-secondary">选择全部章节</button>
+                    <button type="button" id="academicSelectNone" class="btn btn-secondary">清除选择</button>
+                </div>
+                <div id="academicEditableSections"></div>
+                <p id="academicRevisionNotice" role="status"></p>
+                <div class="academic-actions">
+                    <button type="button" id="academicRevise" class="btn btn-primary">按我的意见修订并复审（产生费用）</button>
+                    <button type="button" id="academicExport" class="btn btn-secondary">人工确认并导出当前版本（不调用LLM）</button>
+                </div>
+                <div id="academicRevisionPreview" hidden>
+                    <h4>候选版本 · 尚未替换当前稿</h4>
+                    <p id="academicCandidateStatus"></p>
+                    <div id="academicRevisionComparison"></div>
+                    <div class="academic-actions">
+                        <button type="button" id="academicAcceptRevision" class="btn btn-primary">采用新版（不调用LLM）</button>
+                        <button type="button" id="academicDiscardRevision" class="btn btn-secondary">保留旧版（不调用LLM）</button>
+                    </div>
+                </div>
+                <details class="academic-version-history">
+                    <summary>版本记录与下载</summary>
+                    <div id="academicVersionHistory"></div>
+                </details>
+            </div>
+        </section>
+
+        <div class="margin-div research-output-container">
+            <!-- Move spinner to the left side of the text -->
+            <h2><div id="modernSpinner" class="modern-spinner"></div> Research Progress <button id="expandOutputBtn" class="expand-button" title="Expand"><i class="fas fa-expand-alt"></i></button></h2>
+            <p class="mt-2 text-left" style="font-size: 0.8rem;">
+                Watch as the AI works to gather information and analyze your topic in real-time.</p>
+            <div id="output"></div>
+        </div>
+        <div class="images_div">
+            <div id="selectedImagesContainer" style="display: none;"></div>
+        </div>
+        <div class="margin-div report-container">
+            <h2>Research Report
+                <button id="copyToClipboardTop" class="icon-button" title="Copy" style="display: none;">
+                    <i class="fas fa-copy"></i>
+                </button>
+                <button id="expandReportBtn" class="expand-button" title="Expand">
+                    <i class="fas fa-expand-alt"></i>
+                </button>
+            </h2>
+            <div class="report-toolbar">
+                <div class="report-actions" style="display: none;">
+                    <a id="downloadLinkTop" href="#" class="report-action-btn disabled" target="_blank" rel="noopener noreferrer">
+                        <i class="fas fa-file-pdf"></i> PDF
+                    </a>
+                    <a id="downloadLinkWordTop" href="#" class="report-action-btn disabled" target="_blank" rel="noopener noreferrer">
+                        <i class="fas fa-file-word"></i> Word
+                    </a>
+                    <a id="downloadLinkMdTop" href="#" class="report-action-btn disabled" target="_blank" rel="noopener noreferrer">
+                        <i class="fas fa-file-lines"></i> Markdown
+                    </a>
+                </div>
+                <div id="jsonButtonContainer" style="display: none;">
+                    <a id="downloadLinkJsonTop" href="#" class="report-action-btn disabled" target="_blank" rel="noopener noreferrer">
+                        <i class="fas fa-file-code"></i> JSON
+                    </a>
+                </div>
+            </div>
+            <div id="reportContainer"></div>
+            <div id="reportActions" style="display: none;">
+                <div class="alert alert-info" role="alert" id="status"></div>
+            </div>
+        </div>
+
+        <!-- Chat Container -->
+        <div class="margin-div chat-container" id="chatContainer" style="display: none;">
+            <h2><i class="fas fa-comments"></i> Chat with AI about this research <button id="expandChatBtn" class="expand-button" title="Expand"><i class="fas fa-expand-alt"></i></button></h2>
+            <p class="text-muted">Ask questions about the research report to get more insights</p>
+            <div id="chatMessages" class="chat-messages"></div>
+            <div class="chat-input-container">
+                <textarea id="chatInput" class="form-control chat-input" placeholder="Ask a question about this research..." rows="2"></textarea>
+                <button id="voiceInputBtn" class="btn btn-secondary" title="Use voice input">
+                    <i class="fas fa-microphone"></i>
+                </button>
+                <button id="sendChatBtn" class="btn btn-primary">
+                    <i class="fas fa-paper-plane"></i> Send
+                </button>
+            </div>
+        </div>
+        </section>
+
+        <!-- Fixed bottom bar styled like the top credits bar -->
+    </main>
+
+    <!-- Conversation History Panel -->
+    <div class="history-panel" id="historyPanel">
+        <div class="history-panel-header">
+            <h3><i class="fas fa-history"></i> Research History</h3>
+            <div class="history-panel-actions">
+                <button id="historyPanelToggle" class="history-action-btn" title="Close panel">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+        </div>
+        <div class="history-panel-search">
+            <input type="text" id="historySearch" placeholder="Search research history...">
+            <button id="historySearchBtn" class="history-action-btn" title="Search">
+                <i class="fas fa-search"></i>
+            </button>
+        </div>
+        <div class="history-panel-filters">
+            <select id="historySortOrder">
+                <option value="newest">Newest First</option>
+                <option value="oldest">Oldest First</option>
+            </select>
+            <!-- JS will add Import/Export/Debug buttons here -->
+            <button id="historyClearBtn" class="history-action-btn" title="Clear all history">
+                <i class="fas fa-trash-alt"></i>
+            </button>
+        </div>
+        <div class="history-panel-entries" id="historyEntries">
+            <!-- Entries will be populated dynamically -->
+        </div>
+    </div>
+    
+    <!-- Sticky Downloads Bar -->
+    <div class="sticky-downloads-bar" id="stickyDownloadsBar" style="display: none;"> <!-- Initially hidden -->
+        <div class="download-buttons-container">
+            <a id="copyToClipboard" class="download-option-btn disabled">
+                <i class="fas fa-copy"></i> Copy (Markdown)
+            </a>
+            <a id="downloadLinkMd" href="#" class="download-option-btn disabled" target="_blank" rel="noopener noreferrer">
+                <i class="fas fa-file-lines"></i> Markdown
+            </a>
+            <a id="downloadLink" href="#" class="download-option-btn disabled" target="_blank" rel="noopener noreferrer">
+                <i class="fas fa-file-pdf"></i> PDF
+            </a>
+            <a id="downloadLinkWord" href="#" class="download-option-btn disabled" target="_blank" rel="noopener noreferrer">
+                <i class="fas fa-file-word"></i> Word
+            </a>
+            <a id="downloadLinkJson" href="#" class="download-option-btn disabled" target="_blank" rel="noopener noreferrer">
+                <i class="fas fa-file-code"></i> Log (JSON)
+            </a>
+        </div>
+    </div>
+
+    <footer>
+        <p>
+            <a target="_blank" href="https://gptr.dev">Homepage</a> |
+            <a target="_blank" href="https://github.com/assafelovic/gpt-researcher">GitHub</a> |
+            <a target="_blank" href="https://discord.gg/spBgZmm3Xe">Discord</a>
+        </p>
+        <p>GPT Researcher &copy; 2024</p>
+    </footer>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/showdown/1.9.1/showdown.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.2.6/purify.min.js"
+            integrity="sha512-YlctBG9PGZIhh9keoqI3eZkQM9T8QUbiBi7qNYAO/TUEo8jqWX5pLp5+x1cKRQDRzJ/lyGyJ9WUVNIRduxIIFw=="
+            crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script src="/site/scripts.js"></script>
+    <script>
+        // Auto-resize textarea as content grows
+        const taskTextarea = document.getElementById('task');
+        if (taskTextarea) {
+            // Set initial height
+            taskTextarea.setAttribute('style', 'height: 38px; overflow-y: hidden;');
+
+            // Function to resize textarea based on content
+            const resizeTextarea = () => {
+                taskTextarea.style.height = 'auto';
+                taskTextarea.style.height = taskTextarea.scrollHeight + 'px';
+            };
+
+            // Add event listeners for input and focus
+            taskTextarea.addEventListener('input', resizeTextarea);
+            taskTextarea.addEventListener('focus', resizeTextarea);
+        }
+
+        // Ensure feature panels are positioned correctly on window resize
+        window.addEventListener('resize', function () {
+            // Adjust the feature panel width based on screen size
+            const viewportWidth = window.innerWidth;
+            const featurePanel = document.querySelector('.feature-panel');
+
+            if (featurePanel) {
+                if (viewportWidth < 1400) {
+                    featurePanel.style.display = 'none';
+                } else {
+                    featurePanel.style.display = 'block';
+                    // Adjust width based on screen size
+                    const panelWidth = Math.min(280, Math.max(200, viewportWidth * 0.15));
+                    featurePanel.style.width = `${panelWidth}px`;
+                }
+            }
+        });
+    </script>
+</body>
+
+</html>
