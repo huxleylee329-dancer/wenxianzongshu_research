@@ -1,5 +1,4 @@
 import React from 'react';
-import Image from "next/image";
 
 interface HeaderProps {
   loading?: boolean;      // Indicates if research is currently in progress
@@ -21,13 +20,7 @@ const Header = ({ loading, isStopped, showResult, onStop, onNewResearch, isCopil
         <div className="flex flex-col items-center">
           {/* Logo/Home link */}
           <a href="/">
-            <img
-              src="/img/gptr-logo.png"
-              alt="logo"
-              width={60}
-              height={60}
-              className="lg:h-16 lg:w-16"
-            />
+            <span className="flex h-[60px] w-[60px] items-center justify-center rounded-xl bg-sky-500/20 text-lg font-semibold text-sky-200 lg:h-16 lg:w-16">RW</span>
           </a>
           
           {/* Action buttons container */}

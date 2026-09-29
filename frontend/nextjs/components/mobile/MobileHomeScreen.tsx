@@ -135,15 +135,9 @@ export default function MobileHomeScreen({
       {/* Header with logo and title */}
       <div className="pt-10 px-6 text-center mb-8">
         <div className="flex justify-center mb-3">
-          <img
-            src="/img/gptr-logo.png"
-            alt="GPT Researcher"
-            width={60}
-            height={60}
-            className="rounded-xl"
-          />
+          <div className="flex h-[60px] w-[60px] items-center justify-center rounded-xl bg-sky-500/20 text-lg font-semibold text-sky-200">RW</div>
         </div>
-        <p className="text-gray-400 text-sm">Say Hello to GPT Researcher, your AI partner for instant insights and comprehensive research</p>
+        <p className="text-gray-400 text-sm">Your research workspace for evidence-backed insights and comprehensive reports</p>
       </div>
 
       {/* Search Box */}
@@ -312,4 +306,4 @@ export default function MobileHomeScreen({
       `}</style>
     </div>
   );
-} 
+}

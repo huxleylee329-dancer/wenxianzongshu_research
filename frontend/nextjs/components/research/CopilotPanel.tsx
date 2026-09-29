@@ -80,16 +80,10 @@ const CopilotPanel: React.FC<CopilotPanelProps> = ({
         {/* Left side */}
         <div className="flex items-center">
           <a href="/" className="mr-3">
-            <img
-              src="/img/gptr-logo.png"
-              alt="logo"
-              width={32}
-              height={32}
-              className="rounded-md"
-            />
+            <span className="flex h-8 w-8 items-center justify-center rounded-md bg-sky-500/20 text-xs font-semibold text-sky-200">RW</span>
           </a>
           <h2 className="text-base font-medium text-gray-200">
-            GPT Researcher
+            Research Workbench
           </h2>
         </div>
         
@@ -226,4 +220,4 @@ const CopilotPanel: React.FC<CopilotPanelProps> = ({
   );
 };
 
-export default CopilotPanel; 
+export default CopilotPanel;

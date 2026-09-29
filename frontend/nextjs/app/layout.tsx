@@ -8,22 +8,18 @@ import Script from 'next/script';
 
 const inter = Lexend({ subsets: ["latin"] });
 
-let title = "GPT Researcher";
+let title = "Research Workbench";
 let description =
   "LLM based autonomous agent that conducts local and web research on any topic and generates a comprehensive report with citations.";
-let url = "https://github.com/assafelovic/gpt-researcher";
+let url = "http://localhost:3000";
 let ogimage = "/favicon.ico";
-let sitename = "GPT Researcher";
+let sitename = "Research Workbench";
 
 export const metadata: Metadata = {
   metadataBase: new URL(url),
   title,
   description,
   manifest: '/manifest.json',
-  icons: {
-    icon: "/img/gptr-black-logo.png",
-    apple: '/img/gptr-black-logo.png',
-  },
   appleWebApp: {
     capable: true,
     statusBarStyle: 'default',
@@ -66,7 +62,6 @@ export default function RootLayout({
         <GoogleAnalytics gaId={process.env.NEXT_PUBLIC_GA_MEASUREMENT_ID!} />
         <meta name="apple-mobile-web-app-capable" content="yes" />
         <meta name="apple-mobile-web-app-status-bar-style" content="default" />
-        <link rel="apple-touch-icon" href="/img/gptr-black-logo.png" />
       </head>
       <body
         className={`app-container ${inter.className} flex min-h-screen flex-col justify-between`}
