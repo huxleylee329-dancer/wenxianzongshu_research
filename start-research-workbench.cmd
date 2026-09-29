@@ -2,13 +2,13 @@
 setlocal EnableExtensions
 
 cd /d "%~dp0"
-title GPT Researcher Workbench
+title Research Workbench
 
 set "APP_URL=http://127.0.0.1:8000/"
 set "PYTHON=%CD%\.venv\Scripts\python.exe"
 
 echo.
-echo  GPT Researcher Workbench
+echo  Research Workbench
 echo  ========================
 echo.
 
@@ -42,9 +42,9 @@ set "PYTHONPATH=%CD%;%CD%\backend"
 netstat -ano | findstr /R /C:":8000 .*LISTENING" >nul
 if not errorlevel 1 (
   powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
-    "try { $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri '%APP_URL%'; if ($r.StatusCode -eq 200 -and $r.Content -match 'GPT Researcher') { exit 0 } } catch {}; exit 1"
+    "try { $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri '%APP_URL%'; if ($r.StatusCode -eq 200 -and $r.Content -match 'Research Workbench') { exit 0 } } catch {}; exit 1"
   if not errorlevel 1 (
-    echo [OK] GPT Researcher is already running on port 8000.
+    echo [OK] Research Workbench is already running on port 8000.
     echo [OPEN] %APP_URL%
     start "" "%APP_URL%"
     echo.

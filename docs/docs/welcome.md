@@ -1,13 +1,14 @@
-# Welcome
+# Research Workbench
 
-Hey there! 👋
+Research Workbench 是一个面向学术检索、论文筛选、证据审计和结构化报告写作的本地研究工作台。
 
-We're a team of AI researchers and developers who are passionate about building the next generation of AI assistants. 
-Our mission is to empower individuals and organizations with accurate, unbiased, and factual information.
+当前仓库重点提供：
 
-### GPT Researcher
-Quickly accessing relevant and trustworthy information is more crucial than ever. However, we've learned that none of today's search engines provide a suitable tool that provides factual, explicit and objective answers without the need to continuously click and explore multiple sites for a given research task. 
+- Web、本地文档和 MCP 数据源检索；
+- arXiv 与 Semantic Scholar 学术检索；
+- 运行级论文候选收集、确定性筛选和主题相关性判断；
+- 可验证的筛选审计快照与报告附录；
+- 面向学术写作的 LangGraph 工作流；
+- 静态与 Next.js 双前端。
 
-This is why we've built the trending open source **[GPT Researcher](https://github.com/assafelovic/gpt-researcher)**. GPT Researcher is an autonomous agent that takes care of the tedious task of research for you, by scraping, filtering and aggregating over 20+ web sources per a single research task. 
-
-To learn more about GPT Researcher, check out the [documentation page](/docs/gpt-researcher/getting-started/introduction).
+安装、启动和配置说明请阅读仓库根目录的 [README](https://github.com/huxleylee329-dancer/wenxianzongshu_research#readme)。

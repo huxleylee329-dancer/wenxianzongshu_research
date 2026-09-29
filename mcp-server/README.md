@@ -1,66 +1,20 @@
-# 🔍 GPT Researcher MCP Server
+# Research Workbench MCP
 
-> **Note:** This content has been moved to a dedicated repository: [https://github.com/assafelovic/gptr-mcp](https://github.com/assafelovic/gptr-mcp)
+本目录保留 Research Workbench 的 MCP 接入说明。MCP 用于把外部工具和数据源接入研究流程。
 
-## Overview
+## 能力
 
-The GPT Researcher MCP Server enables AI assistants like Claude to conduct comprehensive web research and generate detailed reports via the Machine Conversation Protocol (MCP).
+- 启动深度研究或快速搜索。
+- 读取研究上下文和来源。
+- 基于已收集证据生成报告。
+- 连接本地或远程 MCP 服务。
 
-## Why GPT Researcher MCP?
+## 配置原则
 
-While LLM apps can access web search tools with MCP, **GPT Researcher MCP delivers deep research results.** Standard search tools return raw results requiring manual filtering, often containing irrelevant sources and wasting context window space.
+- MCP 服务配置应通过运行参数或本地环境提供。
+- Token、API Key 和私有 Header 不得写入仓库。
+- 自动化测试必须使用 fake/mock MCP 服务，不能依赖真实外部进程。
 
-GPT Researcher autonomously explores and validates numerous sources, focusing only on relevant, trusted and up-to-date information. Though slightly slower than standard search (~30 seconds wait), it delivers:
+当前项目仓库：<https://github.com/huxleylee329-dancer/wenxianzongshu_research>
 
-* ✨ Higher quality information
-* 📊 Optimized context usage
-* 🔎 Comprehensive results
-* 🧠 Better reasoning for LLMs
-
-## Features
-
-### Resources
-* `research_resource`: Get web resources related to a given task via research.
-
-### Primary Tools
-* `deep_research`: Performs deep web research on a topic, finding reliable and relevant information
-* `quick_search`: Performs a fast web search optimized for speed over quality 
-* `write_report`: Generate a report based on research results
-* `get_research_sources`: Get the sources used in the research
-* `get_research_context`: Get the full context of the research
-
-## Installation
-
-For detailed installation and usage instructions, please visit the [official repository](https://github.com/assafelovic/gptr-mcp).
-
-Quick start:
-
-1. Clone the new repository:
-   ```bash
-   git clone https://github.com/assafelovic/gptr-mcp.git
-   cd gptr-mcp
-   ```
-
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. Create a `.env` file with your API keys:
-   ```
-   OPENAI_API_KEY=your_openai_api_key
-   TAVILY_API_KEY=your_tavily_api_key
-   ```
-
-4. Run the server:
-   ```bash
-   python server.py
-   ```
-
-For Docker deployment, Claude Desktop integration, example usage, and troubleshooting, please refer to the [full documentation](https://github.com/assafelovic/gptr-mcp).
-
-## Support & Contact
-
-* Website: [gptr.dev](https://gptr.dev)
-* Email: assaf.elovic@gmail.com
-* GitHub: [assafelovic/gptr-mcp](https://github.com/assafelovic/gptr-mcp) :-)
+核心实现和配置示例位于 `gpt_researcher/mcp/`、`.mcp.json` 与根目录 README。

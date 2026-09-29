@@ -6,28 +6,23 @@ import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 
 export default {
-  title: 'GPT Researcher',
-  tagline: 'The leading autonomous AI research agent',
-  url: 'https://docs.gptr.dev',
-  baseUrl: '/',
+  title: 'Research Workbench',
+  tagline: 'Evidence-first academic research workflows',
+  url: 'https://huxleylee329-dancer.github.io',
+  baseUrl: '/wenxianzongshu_research/',
   onBrokenLinks: 'ignore',
   //deploymentBranch: 'master',
   onBrokenMarkdownLinks: 'warn',
-  favicon: 'img/gptr-logo.png',
-  organizationName: 'assafelovic',
+  organizationName: 'huxleylee329-dancer',
   trailingSlash: false,
-  projectName: 'gpt-researcher',
+  projectName: 'wenxianzongshu_research',
   markdown: {
     mermaid: true,
   },
   themes: ['@docusaurus/theme-mermaid'],
   themeConfig: {
     navbar: {
-      title: 'GPT Researcher',
-      logo: {
-        alt: 'GPT Researcher',
-        src: 'img/gptr-logo.png',
-      },
+      title: 'Research Workbench',
       items: [
         {
           type: 'doc',
@@ -36,7 +31,6 @@ export default {
           label: 'Docs',
         },
 
-        {to: 'blog', label: 'Blog', position: 'left'},
         {
           type: 'doc',
           docId: 'faq',
@@ -44,12 +38,7 @@ export default {
           label: 'FAQ',
         },
         {
-            href: 'mailto:assaf.elovic@gmail.com',
-            position: 'left',
-            label: 'Contact',
-        },
-        {
-          href: 'https://github.com/assafelovic/gpt-researcher',
+          href: 'https://github.com/huxleylee329-dancer/wenxianzongshu_research',
           label: 'GitHub',
           position: 'right',
         },
@@ -57,39 +46,8 @@ export default {
     },
     footer: {
       style: 'dark',
-      links: [
-        {
-          title: 'Community',
-          items: [
-            {
-              label: 'Discord',
-              href: 'https://discord.gg/8YkBcCED5y',
-            },
-            {
-              label: 'Twitter',
-              href: 'https://twitter.com/assaf_elovic',
-            },
-            {
-              label: 'LinkedIn',
-              href: 'https://www.linkedin.com/in/assafe/',
-            },
-          ],
-        },
-        {
-          title: 'Company',
-          items: [
-            {
-              label: 'Homepage',
-              href: 'https://gptr.dev',
-            },
-            {
-              label: 'Contact',
-              href: 'mailto:assafelovic@gmail.com',
-            },
-          ],
-        },
-      ],
-      copyright: `Copyright © ${new Date().getFullYear()} GPT Researcher.`,
+      links: [],
+      copyright: `Copyright © ${new Date().getFullYear()} Research Workbench contributors.`,
     },
   },
   presets: [
@@ -98,14 +56,13 @@ export default {
       {
         docs: {
           sidebarPath: require.resolve('./sidebars.js'),
+          include: ['welcome.md'],
           editUrl:
-            'https://github.com/assafelovic/gpt-researcher/tree/master/docs',
+            'https://github.com/huxleylee329-dancer/wenxianzongshu_research/tree/feature/academic-search/docs',
           remarkPlugins: [remarkMath],
           rehypePlugins: [rehypeKatex],
         },
-        blog: {
-          onUntruncatedBlogPosts: 'ignore',
-        },
+        blog: false,
         theme: {
           customCss: require.resolve('./src/css/custom.css'),
         },

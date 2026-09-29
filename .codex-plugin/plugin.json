@@ -1,24 +1,24 @@
 {
   "name": "gpt-researcher",
   "version": "0.1.0",
-  "description": "Autonomous deep research from Codex via MCP",
+  "description": "Evidence-first research workflows from Codex via MCP",
   "author": {
-    "name": "assafelovic",
-    "url": "https://github.com/assafelovic/gpt-researcher"
+    "name": "Research Workbench contributors",
+    "url": "https://github.com/huxleylee329-dancer/wenxianzongshu_research"
   },
-  "homepage": "https://github.com/assafelovic/gpt-researcher",
-  "repository": "https://github.com/assafelovic/gpt-researcher",
+  "homepage": "https://github.com/huxleylee329-dancer/wenxianzongshu_research",
+  "repository": "https://github.com/huxleylee329-dancer/wenxianzongshu_research",
   "keywords": [
     "mcp",
     "codex"
   ],
   "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "GPT Researcher",
-    "shortDescription": "Autonomous deep research from Codex via MCP",
-    "longDescription": "An autonomous agent that conducts deep research on any data using any LLM providers.",
+    "displayName": "Research Workbench",
+    "shortDescription": "Evidence-first research from Codex via MCP",
+    "longDescription": "A local research workbench for evidence retrieval, paper screening, and structured reports.",
     "category": "Research",
-    "websiteURL": "https://github.com/assafelovic/gpt-researcher"
+    "websiteURL": "https://github.com/huxleylee329-dancer/wenxianzongshu_research"
   },
   "skills": "./skills/"
 }

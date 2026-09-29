@@ -1,7 +1,7 @@
 {
   "name": "gpt-researcher",
   "version": "1.0.27",
-  "description": "WebSocket client for GPT Researcher",
+  "description": "WebSocket client for Research Workbench",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
@@ -17,12 +17,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/assafelovic/gpt-researcher.git"
+    "url": "git+https://github.com/huxleylee329-dancer/wenxianzongshu_research.git"
   },
-  "author": "GPT Researcher Team",
+  "author": "Research Workbench contributors",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/assafelovic/gpt-researcher/issues"
+    "url": "https://github.com/huxleylee329-dancer/wenxianzongshu_research/issues"
   },
-  "homepage": "https://github.com/assafelovic/gpt-researcher#readme"
+  "homepage": "https://github.com/huxleylee329-dancer/wenxianzongshu_research#readme"
 }
