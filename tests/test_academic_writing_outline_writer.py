@@ -1571,7 +1571,7 @@ async def test_delegate_exception_and_cancellation_identity(method: str, cancell
     ("workflow_request", "plan", "evidence", "message"),
     [
         (_request(report_type="outline"), _plan(), _evidence(), "academic outline writer requires report_type 'research_report'"),
-        (_request(report_source="local"), _plan(), _evidence(), "academic outline writer requires report_source 'web'"),
+        (_request(report_source="unsupported"), _plan(), _evidence(), "academic outline writer requires report_source 'web'"),
         (_request(), _plan(research_topic="Different"), _evidence(), "academic outline writer requires topic plan research_topic to match request query"),
         (
             _request(),

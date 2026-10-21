@@ -21,6 +21,7 @@ gpt_researcher.egg-info/
 
 #Ignore my local docs
 my-docs/
+data/academic-library/
 
 #Ignore pycache
 **/__pycache__/

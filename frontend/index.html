@@ -55,7 +55,35 @@
         <section class="form-section academic-profile-options" id="academicProfileOptions" hidden>
           <div class="section-label"><span>03</span><label for="academicProfile">学术报告结构</label></div>
           <select id="academicProfile"><option value="stem_literature_review">STEM 文献综述</option><option value="technical_route_survey">技术路线调研</option><option value="method_comparison">方法比较</option><option value="equipment_material_selection">设备 / 材料选型</option><option value="proposal_research_status">开题研究现状</option><option value="systematic_literature_review">系统文献综述</option></select>
-          <p class="field-help">固定中文目录，由服务器检索器获取证据；目录批准后才进入付费写作。</p>
+          <p class="field-help">固定中文目录；目录批准后进入付费写作。检索与全文状态会单独列出，不把摘要当作全文。</p>
+          <div id="academicLibraryControls" class="academic-library-controls">
+            <label class="field-group" for="academicSourceMode"><span>学术证据来源</span><select id="academicSourceMode"><option value="web">在线论文</option><option value="local">本地知识库</option><option value="hybrid">在线＋本地混合</option></select></label>
+            <fieldset><legend>在线论文源（最多6个）</legend><div id="academicPaperProviders" class="library-providers"></div></fieldset>
+            <details><summary>本地论文知识库</summary>
+              <p class="field-help">勾选本次研究允许使用的文档。原件保存在服务器私有目录，选中片段会进入报告与引用审计，并发送给当前写作模型；使用云端模型时并非完全离线。仅导入你有权使用的文档。</p>
+              <label class="field-group" for="academicLibraryUpload"><span>导入文档（每个≤12MB）</span><input id="academicLibraryUpload" type="file" accept=".pdf,.txt,.md,.csv,.docx,.pptx,.xlsx,.html,.htm" multiple></label>
+              <button type="button" id="academicLibraryRefresh" class="text-button">刷新文档列表</button>
+              <div id="academicLibraryDocuments" class="library-documents"></div>
+              <label class="field-group" for="academicLibraryQuery"><span>检索原文片段</span><input id="academicLibraryQuery" type="search" maxlength="4096" placeholder="关键词或研究问题"></label>
+              <button type="button" id="academicLibrarySearch" class="text-button">检索知识库（不调用写作LLM）</button>
+              <div id="academicLibraryResults" class="library-results"></div>
+            </details>
+            <p id="academicLibraryStatus" class="field-help" aria-live="polite">尚未加载知识库配置。</p>
+            <details id="academicToolPolicyPanel">
+              <summary>本机工具助手 · SFT v1</summary>
+              <p class="field-help">使用上方选定的论文源和文档。本机模型每次只建议一步工具操作；确认后才执行。在线检索会访问论文源，结果不会自动进入报告。</p>
+              <p id="academicToolPolicyModel" class="field-help" aria-live="polite">尚未检查本机模型状态。</p>
+              <button type="button" id="academicToolPolicyCheck" class="text-button">检查本机状态</button>
+              <label class="field-group" for="academicToolPolicyTask"><span>本次工具任务</span><textarea id="academicToolPolicyTask" rows="3" maxlength="4096" placeholder="例如：检索所选文档中的评价指标，或查找相关论文"></textarea></label>
+              <button type="button" id="academicToolPolicyPlan" class="text-button" disabled>生成工具建议（本机）</button>
+              <p id="academicToolPolicyStatus" class="field-help" aria-live="polite">输入任务后生成建议；每一步都需要单独确认。</p>
+              <div id="academicToolPolicyDecision" class="library-results" hidden></div>
+              <button type="button" id="academicToolPolicyExecute" class="text-button" disabled>确认执行该工具</button>
+              <button type="button" id="academicToolPolicyCancel" class="text-button" disabled>取消建议</button>
+              <button type="button" id="academicToolPolicyClear" class="text-button" disabled>清空工具会话</button>
+              <div id="academicToolPolicyResults" class="library-results" aria-live="polite"></div>
+            </details>
+          </div>
         </section>
         <details class="advanced-settings" id="advancedSettings">
           <summary><span><svg><use href="#i-settings"/></svg> 普通研究高级设置</span><svg class="chevron"><use href="#i-chevron"/></svg></summary>
@@ -82,6 +110,7 @@
 
     <section class="work-column" aria-label="研究工作区">
       <header class="workspace-header"><div><span class="eyebrow">LIVE WORKSPACE</span><h2>研究控制台</h2><p id="workspaceSubtitle">等待新的研究任务</p></div><div class="run-state" id="runState" data-state="idle"><span></span><strong id="researchStatus">空闲</strong></div></header>
+      <section class="workspace-card" id="academicEvidenceSources" hidden aria-live="polite"></section>
       <section class="empty-state" id="emptyState">
         <div class="radar-visual" aria-hidden="true"><span></span><span></span><span></span><i></i></div><div><span class="eyebrow">READY</span><h2>研究轨迹会在这里展开</h2><p>左侧输入主题并开始后，你会依次看到检索计划、实时日志、审批节点、引用复核与最终报告。</p></div>
         <div class="capability-grid"><article><strong>01</strong><span>证据检索</span><small>Web / 学术来源</small></article><article><strong>02</strong><span>结构化写作</span><small>固定报告模板</small></article><article><strong>03</strong><span>引用审查</span><small>正文与证据对齐</small></article></div>
@@ -119,6 +148,7 @@
   <div id="toastRegion" class="toast-region" aria-live="polite"></div>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/showdown/1.9.1/showdown.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.2.6/purify.min.js" integrity="sha512-YlctBG9PGZIhh9keoqI3eZkQM9T8QUbiBi7qNYAO/TUEo8jqWX5pLp5+x1cKRQDRzJ/lyGyJ9WUVNIRduxIIFw==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script src="/site/academic_library.js"></script>
   <script src="/site/scripts.js"></script>
 </body>
 </html>

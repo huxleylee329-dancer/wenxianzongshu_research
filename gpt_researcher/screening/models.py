@@ -7,6 +7,12 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+AcademicProvider = Literal[
+    "arxiv", "semantic_scholar", "openalex", "pubmed_central",
+    "hal", "osti", "openaire", "crossref", "europe_pmc", "zenodo",
+]
+
+
 class ExternalIdentifier(BaseModel):
     """A minimal immutable provider identifier."""
 
@@ -30,7 +36,7 @@ class PaperCandidate(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     candidate_id: str
-    source: Literal["arxiv", "semantic_scholar"]
+    source: AcademicProvider
     source_record_id: str | None
     retrieval_query: str
     source_rank: Annotated[int, Field(gt=0)]
@@ -72,7 +78,7 @@ class PaperCandidate(BaseModel):
 
 def build_candidate_id(
     *,
-    source: Literal["arxiv", "semantic_scholar"],
+    source: AcademicProvider,
     source_record_id: str | None,
     doi: str | None,
     href: str,

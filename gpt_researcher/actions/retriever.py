@@ -35,6 +35,10 @@ def get_retriever(retriever: str):
         - xquik: Xquik X/Twitter search
         - getxapi: GetXAPI X/Twitter search
     """
+    from gpt_researcher.retrievers.scholarly import SCHOLARLY_RETRIEVERS
+
+    if retriever in SCHOLARLY_RETRIEVERS:
+        return SCHOLARLY_RETRIEVERS[retriever]
     match retriever:
         case "google":
             from gpt_researcher.retrievers import GoogleSearch

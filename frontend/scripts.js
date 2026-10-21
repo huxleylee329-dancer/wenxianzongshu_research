@@ -255,6 +255,7 @@
 
   function renderBusyControls() {
     const busy = state.run.active || state.academic.busy;
+    window.academicLibrary.setBusy(busy);
     const outlineActionable = state.run.status === 'awaiting_outline'
       && !dom.academicOutlinePanel.hidden
       && Boolean(state.academic.sessionId);
@@ -485,6 +486,7 @@
     dom.task.maxLength = academic ? 4096 : 12000;
     dom.academicProfileOptions.hidden = !academic;
     dom.advancedSettings.hidden = academic;
+    if (academic) window.academicLibrary.load();
     dom.modeHint.textContent = MODE_HINTS[reportType] || '';
     dom.submitButton.querySelector('span').textContent = academic ? '启动学术工作流' : '开始研究';
     updateTaskCount();
@@ -693,13 +695,20 @@
       showToast('Academic 研究问题最多 4096 个字符，请精简后再提交。', 'error');
       return;
     }
+    let academicOptions;
+    if (academic) {
+      try { academicOptions = window.academicLibrary.options(); }
+      catch (error) { showToast(error.message, 'error'); return; }
+      byId('academicEvidenceSources').replaceChildren();
+      byId('academicEvidenceSources').hidden = true;
+    }
     prepareNewRun(academic ? 'academic' : 'general', task);
     if (academic) {
       dom.academicWorkflowPanel.hidden = false;
       state.academic.busy = true;
       updateAcademicStage('planning');
       appendActivity('学术工作流', '正在规划研究问题与证据检索。');
-      sendCommand('academic_start', { query: task, report_mode: byId('academicProfile').value }, { fresh: true });
+      sendCommand('academic_start', { query: task, report_mode: byId('academicProfile').value, ...academicOptions }, { fresh: true });
       return;
     }
     let payload;
@@ -969,6 +978,9 @@
   function handleAcademicMessage(data) {
     dom.academicWorkflowPanel.hidden = false;
     switch (data.type) {
+      case 'academic_evidence':
+        window.academicLibrary.renderEvidence(data);
+        break;
       case 'academic_progress':
         updateAcademicStage(text(data.stage)); appendActivity('Academic LangGraph', text(data.label) || text(data.stage));
         if (data.stage === 'writing') setRunState('writing', '逐节写作', state.run.task);
@@ -1422,7 +1434,7 @@
   }
 
   function bootstrap() {
-    collectDom(); markdownConverter = createMarkdownConverter(); bindEvents(); setupSpeechRecognition(); loadHistory();
+    collectDom(); window.academicLibrary.setup(); markdownConverter = createMarkdownConverter(); bindEvents(); setupSpeechRecognition(); loadHistory();
     updateTaskCount(); renderMode(); validateMcpConfig(); resetDownloads(); setRunState('idle'); renderConnection(); restoreAcademicSession();
   }
 

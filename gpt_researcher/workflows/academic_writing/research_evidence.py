@@ -94,7 +94,7 @@ def _create_production_researcher(
         raise ValueError(
             "academic research evidence requires report_type 'research_report'"
         )
-    if request.report_source != "web":
+    if request.report_source not in ("web", "local", "hybrid"):
         raise ValueError(
             "academic research evidence requires report_source 'web'"
         )
@@ -105,6 +105,11 @@ def _create_production_researcher(
     tone = tone_by_value.get(request.tone)
     if tone is None:
         raise ValueError("academic research evidence requires a valid Tone value")
+
+    if request.report_source in ("local", "hybrid"):
+        from gpt_researcher.academic_library.research import create_library_researcher
+
+        return create_library_researcher(request, topic_plan)
 
     from gpt_researcher.agent import GPTResearcher
 

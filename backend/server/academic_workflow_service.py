@@ -708,11 +708,12 @@ def _artifact_url(session_id: str, filename: str) -> str:
     return f"/outputs/academic/{session_id}/{filename}"
 
 
-def _production_adapter() -> object:
+def _production_adapter(*, researcher_factory=None) -> object:
     terminal = _TerminalDelegate()
     return GPTResearcherTopicPlannerAdapter(
         GPTResearcherResearchEvidenceAdapter(
-            GPTResearcherOutlineWriterAdapter(terminal)
+            GPTResearcherOutlineWriterAdapter(terminal),
+            researcher_factory=researcher_factory,
         )
     )
 
@@ -980,6 +981,7 @@ class AcademicWorkflowService:
         ).resolve()
         self._output_root.mkdir(parents=True, exist_ok=True)
         self._adapter_factory = _production_adapter if adapter_factory is None else adapter_factory
+        self._uses_default_adapter = adapter_factory is None
         self._composer_factory = composer_factory
         self._writer_factory = writer_factory
         self._reviewer_factory = reviewer_factory
@@ -999,7 +1001,14 @@ class AcademicWorkflowService:
         return target
 
     async def start(self, payload: object, emit: SafeEmitter) -> None:
-        values = _exact_payload(payload, frozenset({"query", "report_mode"}))
+        required = frozenset({"query", "report_mode"})
+        optional = frozenset({"source_mode", "paper_providers", "document_ids"})
+        if type(payload) is not dict or any(type(key) is not str for key in payload):
+            raise AcademicWorkflowServiceError("invalid_request")
+        keys = frozenset(payload)
+        if not required <= keys or keys - required - optional:
+            raise AcademicWorkflowServiceError("invalid_request")
+        values = _exact_payload(payload, keys)
         query = dict.__getitem__(values, "query")
         report_mode = dict.__getitem__(values, "report_mode")
         if (
@@ -1010,6 +1019,23 @@ class AcademicWorkflowService:
             or report_mode not in _FIXED_PROFILES
         ):
             raise AcademicWorkflowServiceError("invalid_request")
+        from gpt_researcher.academic_library.research import (
+            AcademicPaperResearcher, DEFAULT_PROVIDERS, validate_selection,
+        )
+        from gpt_researcher.academic_library.models import LibraryError
+        from gpt_researcher.academic_library.store import get_library
+
+        try:
+            configured = tuple(p.strip() for p in os.getenv("ACADEMIC_PAPER_PROVIDERS", ",".join(DEFAULT_PROVIDERS)).split(",") if p.strip())
+            source_mode, providers, document_ids = validate_selection(
+                values.get("source_mode", "web"), values.get("paper_providers", configured), values.get("document_ids", ()),
+            )
+            if document_ids:
+                library = await asyncio.to_thread(get_library)
+                for document_id in document_ids:
+                    await asyncio.to_thread(library.original, document_id)
+        except LibraryError:
+            raise AcademicWorkflowServiceError("invalid_request") from None
         token = uuid.uuid4().hex
         session_id = "academic-" + token
         identity = AcademicWorkflowIdentity(
@@ -1018,7 +1044,15 @@ class AcademicWorkflowService:
             run_id="academic-run:" + token,
         )
         output_dir = self._new_output_dir(session_id)
-        adapter = _ProgressAdapter(self._adapter_factory(), emit)
+        handles = []
+
+        def researcher_factory(request, topic_plan):
+            handle = AcademicPaperResearcher(request, topic_plan, providers=providers, document_ids=document_ids)
+            handles.append(handle)
+            return handle
+
+        delegate = _production_adapter(researcher_factory=researcher_factory) if self._uses_default_adapter else self._adapter_factory()
+        adapter = _ProgressAdapter(delegate, emit)
         recorder = _SafeRunRecorder(session_id, output_dir)
         session = _AcademicSession(
             session_id, identity, adapter, output_dir, recorder
@@ -1032,11 +1066,11 @@ class AcademicWorkflowService:
             run_id=identity.run_id,
             query=query,
             report_type="research_report",
-            report_source="web",
+            report_source=source_mode,
             tone=Tone.Formal.value,
             language="zh-CN",
             source_urls=(),
-            document_urls=(),
+            document_urls=tuple("library:" + doc_id for doc_id in document_ids),
             query_domains=(),
             max_search_results=None,
             report_mode=report_mode,
@@ -1048,14 +1082,21 @@ class AcademicWorkflowService:
                     request, adapter, checkpointer=self._checkpointer
                 )
             except asyncio.CancelledError:
+                handles.clear()
                 session.status = "cancelled"
                 recorder.record("workflow_start", "cancelled")
                 raise
             except Exception:
+                handles.clear()
                 session.status = "failed"
                 recorder.record("workflow_start", "failed", "start_failed")
                 logger.exception("Academic workflow start failed")
                 raise AcademicWorkflowServiceError("start_failed") from None
+            if handles:
+                details = {"type": "academic_evidence", "sources": handles[-1].summaries, "failures": handles[-1].tools.failures, "source_mode": source_mode}
+                handles.clear()
+                _atomic_json(output_dir / "retrieval.json", details)
+                await emit(details)
             if state.phase != "outline_ready" or state.outline is None:
                 session.status = "failed"
                 raise AcademicWorkflowServiceError("start_failed")

@@ -77,6 +77,9 @@ def _duplicate_key(occurrence: CandidateOccurrence) -> tuple[str, str]:
     doi = candidate.doi.strip().casefold() if isinstance(candidate.doi, str) else ""
     if doi:
         return "doi", doi
+    if candidate.source not in ("arxiv", "semantic_scholar"):
+        # No title-only deduplication for the newly integrated providers.
+        return "singleton", candidate.candidate_id
     title = _normalized_title(candidate.title)
     if sum(character.isalnum() for character in title) >= 12:
         return "title", title
@@ -121,6 +124,8 @@ def _classify(candidate: PaperCandidate) -> tuple[PaperType, tuple[str, ...]]:
             for token in publication_tokens
             if token in _PUBLICATION_TYPE_MAP
         }
+        if candidate.source != "semantic_scholar" and "preprint" in publication_tokens:
+            recognized.add(PaperType.PREPRINT)
         if not recognized:
             classified = PaperType.UNKNOWN
         elif len(recognized) == 1:

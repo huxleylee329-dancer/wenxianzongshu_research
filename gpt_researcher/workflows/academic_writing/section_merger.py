@@ -225,7 +225,7 @@ def _project_allowlist(
             return _FAILURE
         if request.report_type != "research_report":
             return _FAILURE
-        if request.report_source != "web":
+        if request.report_source not in ("web", "local", "hybrid"):
             return _FAILURE
         if topic_plan.research_topic != request.query:
             return _FAILURE

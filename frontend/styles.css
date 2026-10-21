@@ -385,3 +385,17 @@ textarea { resize: vertical; min-height: 86px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+
+.academic-library-controls { display: grid; gap: 14px; margin-top: 16px; }
+.academic-library-controls fieldset { min-width: 0; border: 1px solid #405169; border-radius: 8px; padding: 12px; }
+.library-providers { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; font-size: .8rem; }
+.library-providers label, .library-document label { display: flex; align-items: start; gap: 7px; overflow-wrap: anywhere; }
+.academic-library-controls input[type="checkbox"] { width: 16px; height: 16px; flex-shrink: 0; }
+.library-documents, .library-results { max-height: 340px; overflow: auto; margin-block: 12px; }
+.library-document { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding-block: 9px; border-bottom: 1px solid #405169; }
+.library-document label { flex: 1; min-width: 120px; font-size: .8rem; }
+.library-results article { border-bottom: 1px solid #405169; padding: 12px 0; }
+.library-results p { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .8rem; }
+#academicEvidenceSources { padding: 20px; overflow-wrap: anywhere; }
+#academicEvidenceSources p { padding-block: 8px; font-size: .85rem; }
+#academicEvidenceSources a { color: #176ca4; text-decoration: underline; }

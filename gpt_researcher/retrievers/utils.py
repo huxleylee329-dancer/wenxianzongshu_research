@@ -80,6 +80,7 @@ VALID_RETRIEVERS = [
     "mcp",
     "xquik",
     "openalex",
+    "hal", "osti", "openaire", "crossref", "europe_pmc", "zenodo",
     "mock"
 ]
 
@@ -101,7 +102,9 @@ def get_all_retriever_names():
             if os.path.isdir(os.path.join(current_dir, item)) and not item.startswith('__')
         ]
         
-        return retrievers
+        from .scholarly import SCHOLARLY_RETRIEVERS
+
+        return sorted(set(retrievers) | set(SCHOLARLY_RETRIEVERS))
     except Exception as e:
         logger.error(f"Error getting retrievers: {e}")
         return VALID_RETRIEVERS

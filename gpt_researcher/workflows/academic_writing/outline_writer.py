@@ -664,7 +664,7 @@ def _validate_inputs(
     try:
         if request.report_type != "research_report":
             return _REPORT_TYPE_FAILURE
-        if request.report_source != "web":
+        if request.report_source not in ("web", "local", "hybrid"):
             return _REPORT_SOURCE_FAILURE
         if topic_plan.research_topic != request.query:
             return _TOPIC_FAILURE

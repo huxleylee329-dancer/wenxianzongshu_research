@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .models import PaperCandidate
+from .models import AcademicProvider, PaperCandidate
 
 
 class PaperType(str, Enum):
@@ -82,7 +82,7 @@ class ScreeningDecision(BaseModel):
     occurrence_id: str
     retrieval_request_id: str
     candidate_id: str
-    source: Literal["arxiv", "semantic_scholar"]
+    source: AcademicProvider
     retrieval_query: str
     source_rank: Annotated[int, Field(gt=0)]
     included: bool

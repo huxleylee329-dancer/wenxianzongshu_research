@@ -1,0 +1,10 @@
+# Separate Linux virtualenv only. No local/app environment installation.
+# Install torch/torchvision from https://download.pytorch.org/whl/cu128 first.
+torch==2.9.1
+torchvision==0.24.1
+transformers==4.57.3
+accelerate==1.12.0
+bitsandbytes==0.49.1
+trl==0.26.0
+peft==0.18.0
+datasets==4.4.1

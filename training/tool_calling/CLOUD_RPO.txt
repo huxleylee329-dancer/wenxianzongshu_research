@@ -1,0 +1,80 @@
+工具决策 RPO v1 reviewed：样本规则已确认，尚未训练，不要现在租 GPU
+
+1. 当前依据
+已验证 SFT v1 开发集 180/200（90%），含 3 个授权失败及 4 个格式失败。
+最近 GRPO 学习信号门禁未通过，优化器更新为 0；不把它当作已训练模型。
+本包从原 v1 adapter 继续，不从 base 重建 LoRA，不重跑 SFT。
+不保证 95%、不保证真实检索效果、更不保证报告事实质量。
+
+2. 数据与人工审核
+1200 个独立训练输入 = 原 1000 + 原先已准备的 200 个对照输入。
+每个输入配 2 个不同错误类型的 rejected，共 2400 个偏好对；不是 2400 个独立问题。
+30 个训练 family。错误回答来自确定性规则变异，不是模型生成或真实用户日志。
+chosen/rejected 都通过结构解析；chosen 在离线模拟器正确，rejected 不正确。
+来源范围、DOI、同名论文消歧、文档范围、澄清及停止是目标；不训练正文写作。
+200 个开发输入与 200 个盲测输入原样保留，不从其中抽取训练样本。
+开发结果已经影响方案设计，不能称为新独立测试；盲测仅在开发门禁通过后生成答案。
+哈希/实体/主题去重不等于证明没有语义泄漏；规则答案也可能有偏差。
+review-sample.txt 提供 35 个任务 / 70 个偏好对，覆盖全部 family 和对照双侧。
+2026-10-06 用户确认“按建议修正，其余规则认可”：认可 65 对展示的规则，
+批准修正另 5 对样本对应的全部 200 对歧义负例。
+“最多/上限 N”下少取一些不能判错；这 200 对改为查询另一个训练主题，
+数量与其余参数不变。其余 2200 对逐字保持；训练输入/chosen、开发/盲测及 v1 adapter 不变。
+每个标签仍标记 human_reviewed=false；manifest 单独记录 sample_rule_review，
+不冒充全量逐条人工审核。修正后的 200 对是按批准规则生成，仍不是模型真实错误。
+data-audit.json 记录前后哈希和 200 对新旧 ID。只使用 tool-calling-rpo-v1-reviewed.zip；
+旧 tool-calling-rpo-v1.zip 保留作对照，不再用于训练。
+已有评测器对数量采用精确匹配，评测分数是固定基准一致性，不等于所有语义正确动作的比例。
+
+3. 与真实生产接口的关系（此次没有接入生产）
+search_papers(query, providers, per_source) 对应 PaperTools.search_papers。
+resolve_paper(identifier) 对应 PaperTools.resolve_paper。
+read_paper 的训练输出是候选 paper_id；生产 API 接受 Paper 对象，
+未来必须由可信注册表把 ID 映射回原始 Paper，不能将模型 JSON 当作 Paper。
+search_library(query, document_ids, limit) 对应 PaperTools.search_library。
+生产低层允许空 document_ids 表示全库；训练安全契约要求非空授权集合。
+mode/provider/document/candidate 权限由服务端确定，绝不能由模型自授。
+现有 AcademicPaperResearcher 仍是固定流程，并没有因本包而改成模型工具代理。
+上线桥接和端到端收益验证属于后续单独确认事项，不以离线通过自动上线。
+
+4. 固定的一次实验（未做 CUDA 实测，显存与时长未知）
+Qwen3-8B，4bit NF4，BF16，已有 v1 LoRA policy 和冻结 v1 reference 共用 base。
+TRL 0.26.0 DPOTrainer：sigmoid DPO + rpo_alpha=1.0 的 chosen NLL；beta=0.1。
+lr=5e-6，batch=1，梯度累积 8，2400 pairs 一轮，共 300 optimizer steps。
+不调参扫描、不自动 retry/resume；训练本身不生成 rollout 或调用真实工具。
+同一 prompt/chat template 与 v1 推理一致，仅 chosen/rejected 回答 + EOS 计算目标。
+禁止截断；prompt<=8192、answer+EOS<=384，Trainer 分词后逐条再比对。
+共享 reference 切换后恢复 policy 和梯度标记；训练前后都验证 reference 权重不变。
+训练前 10 个 canary 必须逐字复现 v1，失败即停止，不训练。
+保存第 150 步应急 adapter 和第 300 步 candidate；不挑多个候选刷开发分数。
+只评估最终 candidate：开发集总正确数须>180、观察到的授权失败=0、
+格式错误不高于 v1，且每个 family 不退步，才评估盲测。
+盲测对 v1 和 candidate 各跑 200 个，要求总数/family 不退步、授权失败=0。
+有限测试上的零失败不是安全保证；运行时权限校验始终保留。
+失败保留 v1，不追加第二轮；成功也只是 candidate_passed_offline_only。
+最多 610 次本地模型生成：10 canary +200 dev +400 blind；训练生成次数为 0。
+整个计算子进程设置 4 小时硬停止，不是预计耗时/费用；结束不会自动归还实例。
+
+5. 开机前准备门禁
+本轮规则审核已记录；开机前仍须确认模型快照/依赖已备齐，并另行确认执行。
+不要租 GPU 等慢速 pip 下载。
+包不含模型、不含环境、不读 .env、不含 API key。
+requirements-grpo.txt 沿用已验证版本，不混用系统 site-packages。
+需要独立 .venv；PyTorch2.9.1+cu128 / torchvision0.24.1+cu128，
+Transformers4.57.3 / TRL0.26.0 / PEFT0.18.0，其他见 requirements。
+不自动安装、下载、切镜像、换模型；模型权重和依赖必须匹配原 v1 manifest。
+本地 CPU 测试不能证明这些 GPU 依赖的真实执行和显存足够。
+
+6. 云端执行（审核和人工批准之后才用；现在不执行）
+解压到全新目录，不覆盖先前结果。激活独立环境后先运行：
+python rpo.py
+默认只检查 manifest/数据，不载入 GPU。
+审核通过后，把 preferences.jsonl 的审核 SHA 原样填入下面命令：
+bash run_rpo_once.sh --execute --ack-synthetic-data --reviewed-data-sha <已审核SHA> --model-dir <原Qwen3-8B完整本地路径> --out runs/rpo-v1
+不要粘贴尖括号占位符。只发起一次，不手动重复启动。
+结果 runs/rpo-results.zip，包含状态、开发/盲测得分与候选 adapter；不包含模型权重。
+无论通过或停止，下载并校验 ZIP 后归还实例以停止租金，不能只关闭网页。
+
+实现依据：固定版本 TRL 源码，不依赖最新版默认参数。
+https://github.com/huggingface/trl/blob/v0.26.0/trl/trainer/dpo_trainer.py
+https://github.com/huggingface/trl/blob/v0.26.0/trl/trainer/dpo_config.py

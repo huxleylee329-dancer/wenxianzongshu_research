@@ -67,6 +67,12 @@ async def handle_academic_command(websocket, data: str) -> None:
             await websocket.send_json(message)
 
         if command == "academic_start":
+            if type(payload) is dict and payload.get("source_mode") in ("local", "hybrid"):
+                from .academic_library_api import require_library_access
+                try:
+                    require_library_access(websocket)
+                except HTTPException:
+                    raise AcademicWorkflowServiceError("library_access_denied") from None
             await academic_workflow_service.start(payload, emit)
         elif command == "academic_decision":
             await academic_workflow_service.decision(payload, emit)

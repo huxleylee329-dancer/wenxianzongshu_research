@@ -96,6 +96,10 @@ async def lifespan(app: FastAPI):
 # App initialization
 app = FastAPI(lifespan=lifespan)
 
+from server.academic_library_api import router as academic_library_router
+
+app.include_router(academic_library_router)
+
 # Configure allowed origins for CORS
 allowed_origins_env = os.getenv("CORS_ALLOW_ORIGINS")
 ALLOWED_ORIGINS = (

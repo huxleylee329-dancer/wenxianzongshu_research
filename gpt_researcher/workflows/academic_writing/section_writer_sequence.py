@@ -184,7 +184,7 @@ def _target_is_accepted(
             return False
         if request.report_type != "research_report":
             return False
-        if request.report_source != "web":
+        if request.report_source not in ("web", "local", "hybrid"):
             return False
         if topic_plan.research_topic != request.query:
             return False
